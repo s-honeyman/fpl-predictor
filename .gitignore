@@ -13,8 +13,10 @@ wheels/
 # except the one file explicitly un-ignored below.
 data/*
 
-# Squad state IS committed (exception to the rule above) - the scheduled cloud
-# routine needs it persisted in the repo to pick up where the last run left
-# off, since each cloud run is a fresh checkout with no other memory between
-# runs.
+# Squad state and the prediction log ARE committed (exceptions to the rule
+# above) - real accumulated state that should persist and be backed up, not
+# regenerable cache. The prediction log specifically is the "get smarter
+# every gameweek" memory (see fpl/prediction_log.py) - losing it would mean
+# losing the accumulated real-world validation data.
 !data/my_squad.json
+!data/prediction_log.jsonl

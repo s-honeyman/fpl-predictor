@@ -38,3 +38,10 @@ def get_bootstrap(force_refresh: bool = False) -> dict:
 def get_fixtures(force_refresh: bool = False) -> list[dict]:
     """All fixtures for the season, including future ones with FDR ratings."""
     return _cached_get(f"{BASE_URL}/fixtures/", "fixtures.json", force_refresh)
+
+
+def get_gameweek_live(gw: int, force_refresh: bool = False) -> dict:
+    """Every player's actual stats for one specific (finished or in-progress)
+    gameweek - one call for the whole league, not one per player. Used to
+    fill in real actuals in the prediction log."""
+    return _cached_get(f"{BASE_URL}/event/{gw}/live/", f"event_{gw}_live.json", force_refresh)
