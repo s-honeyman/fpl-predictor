@@ -56,9 +56,38 @@ Honest read on this: the fix meaningfully improves day-one squad quality (less o
 ## Not yet fixed (this is the honest state, not a promise)
 
 - **No captaincy-specific strategy** - captain is currently just "highest-projected starter," with no consideration of differential vs. template captaincy, which is a known real skill lever among strong human FPL managers.
-- **No chip timing** (Wildcard / Free Hit / Bench Boost / Triple Captain) - flagged as a gap since the very first version of this tool, still not built.
 - **Dynamic backtest's transfer budget (5 per 5-gameweek window) is a reasonable but unvalidated proxy** for real free-transfer accrual and point-hit costs, not an exact rules implementation.
 - **Backtest tested 2 seasons.** A genuinely rigorous validation would test more (data for several more seasons is available from the same free source - `vaastav/Fantasy-Premier-League` on GitHub) - two was enough to establish the over-projection is a real, repeatable pattern and not a one-season fluke, not enough to precisely quantify it.
+
+## Chip timing (`scripts/chip_timing.py`)
+
+Bench Boost and Triple Captain candidates derived from real fixture-difficulty data for your saved squad (reuses `model.py`'s own shrinkage/fixture-multiplier machinery directly, not `ep_next` - which only means anything for the true next real gameweek). Also checks the published fixture list for double/blank gameweeks. Wildcard timing is stated as general community convention, explicitly labeled as such - it's inherently reactive to how the season actually unfolds, which doesn't exist yet to base a specific gameweek on.
+
+Results are quite flat this early pre-season (candidate gameweeks within ~0.2 pts of each other) - an honest reflection of genuine pre-season uncertainty in the fixture-difficulty ratings themselves, not a bug. Re-run periodically as the season progresses and FDR ratings/doubles get confirmed.
+
+## GW1-5 walk-forward plan (`scripts/plan_gw1_5.py`)
+
+Rolls the 5-gameweek projection horizon forward one week at a time for the first 5 gameweeks, checking whether a fixture-swing-driven transfer clears a real value bar (respecting 1 free transfer/week). **Explicitly fixture-only** - there's no live season data yet to react to; once GW1 actually happens, `fpl transfers` (which does react to live results) supersedes this.
+
+## Investigated: is match-level Understat data worth using? (`scripts/validate_recent_form_signal.py`)
+
+Real question raised: is `points_per_game` (a season-to-date average) actually the best signal available, or is there a sharper "recent form" signal we're leaving on the table? The free historical archive includes match-by-match Understat data (xG, xA, shots, key passes) per player - but **only through 2024-25** (no `understat/` folder exists yet for 2025-26 in the archive - this data source lags a season behind the live game, so it can inform research/backtesting but not the actual current squad).
+
+Tested directly: does a player's recent-form xG+xA (last 5 matches) predict their next 5 gameweeks' points better than season-to-date PPG? On a 74-player real sample (2024-25 season, GW20 checkpoint):
+
+| Signal | Correlation with next-5-GW points |
+|---|---|
+| Season-to-date points_per_game (what the model already uses) | **r = 0.751** |
+| Recent-form xG+xA/90, last 5 matches (Understat) | r = 0.027 |
+
+**Honest result: the signal we already use was clearly stronger, not the one we were considering paying for or engineering harder to get.** Caveat worth stating plainly: this isn't a fully fair comparison - season PPG averages ~19 games vs. recent form's 5, so some of the gap is just larger-sample-size noise reduction, not proof that "recency" itself doesn't matter. A cleaner follow-up would match window sizes (e.g. trailing-19-match xG vs. trailing-19-match points) before concluding Understat data isn't worth integrating at all. Not done here - flagged as the fair next test, not skipped silently.
+
+## Considered: top-ranked managers' actual picks, and paid data sources
+
+Two ideas raised and checked for real feasibility, not just discussed:
+
+- **What do top-20 *managers'* (not just top-scoring players') picks look like historically?** Checked directly against FPL's live API: `leagues-classic/314/standings/` (the "Overall" global league) only reflects the *current* season's live standings - there's no free way to retroactively pull who ranked highly in a past season or what they picked. This is buildable **going forward**: once a season is live, the top-N entries and their gameweek-by-gameweek picks are freely fetchable in real time. Not retroactive.
+- **Paid data APIs** - considered specifically (not just "get some football API"): player prop betting odds (e.g. [The Odds API](https://the-odds-api.com)) are the actual highest-value recommendation, not generic stats - reasoning by analogy to `pl-club-forecast`'s bookmaker-odds comparison, where market odds sat right at the practical prediction ceiling. Not pursued yet - the free Understat check above was prioritized first, and turned out to be the more useful thing to test before spending anything.
 
 ## Breakout-player screen (`scripts/breakout_analysis.py`)
 
@@ -75,4 +104,4 @@ Honest caveat: ~110 breakout examples per season by this definition is enough to
 ## Data sources
 
 - Live squad/fixture data: the public FPL API (`fantasy.premierleague.com/api`), no key needed.
-- Historical backtesting data: [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League) on GitHub - free, no auth, actively maintained season-by-season archives.
+- Historical backtesting data: [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League) on GitHub - free, no auth, actively maintained season-by-season archives. Includes per-player match-level Understat data (xG/xA/shots) through 2024-25 - see "Investigated" section above for what that is and isn't useful for.
