@@ -9,5 +9,13 @@ wheels/
 # Virtual environments
 .venv
 
-# Cached API data / local squad state
-data/
+# Cached API data (regenerable, not source)
+data/*.json
+data/backtests/
+data/historical/
+
+# Squad state IS committed (exception to the rule above) - the scheduled cloud
+# routine needs it persisted in the repo to pick up where the last run left
+# off, since each cloud run is a fresh checkout with no other memory between
+# runs.
+!data/my_squad.json
