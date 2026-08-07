@@ -105,3 +105,9 @@ Honest caveat: ~110 breakout examples per season by this definition is enough to
 
 - Live squad/fixture data: the public FPL API (`fantasy.premierleague.com/api`), no key needed.
 - Historical backtesting data: [vaastav/Fantasy-Premier-League](https://github.com/vaastav/Fantasy-Premier-League) on GitHub - free, no auth, actively maintained season-by-season archives. Includes per-player match-level Understat data (xG/xA/shots) through 2024-25 - see "Investigated" section above for what that is and isn't useful for.
+
+## Follow-up: the fair, window-matched re-test
+
+The caveat above (season PPG using more games than the 5-match recent-form window) was closed properly, not just noted and left: re-ran with **matched window lengths** (same number of trailing games for both signals). Result: xG+xA/90 correlation stayed at essentially zero (r=0.043) against season PPG's r=0.746. This rules out the sample-size confound - xG+xA is a genuinely weak predictor of FPL points specifically, not just a noisier one. Makes sense once you consider FPL points reward clean sheets, appearance points, and bonus points (driven by defensive actions), not just attacking output - xG+xA only ever captures the attacking slice.
+
+**Practical conclusion for any paid data source under consideration:** advanced attacking-stats APIs (Sportmonks, TheStatsAPI, FootyStats, and similar) would mostly deliver more of a signal type now validated twice as weak here. The two paid options that plausibly *would* help, because they're a genuinely different kind of signal, not more of the same: **confirmed starting lineups** (targets our proven weak point - minutes/starts reliability, see the breakout-screen findings above) and **player prop betting odds** (market-synthesized probability, same logic as `pl-club-forecast`'s bookmaker-ceiling comparison). Neither implemented yet - a real next step, not a promise.
