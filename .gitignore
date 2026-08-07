@@ -9,10 +9,9 @@ wheels/
 # Virtual environments
 .venv
 
-# Cached API data (regenerable, not source)
-data/*.json
-data/backtests/
-data/historical/
+# Cached API data (regenerable, not source) - ignore everything under data/
+# except the one file explicitly un-ignored below.
+data/*
 
 # Squad state IS committed (exception to the rule above) - the scheduled cloud
 # routine needs it persisted in the repo to pick up where the last run left
