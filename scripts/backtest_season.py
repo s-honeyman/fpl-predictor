@@ -63,6 +63,11 @@ def build_prior_season_lookup(prior_players: pd.DataFrame) -> dict[str, dict]:
             "points_per_game": float(row["points_per_game"]),
             "total_points": int(row["total_points"]),
             "starts": int(row["starts"]),
+            "penalties_order": None if pd.isna(row.get("penalties_order")) else int(row["penalties_order"]),
+            "direct_freekicks_order": None if pd.isna(row.get("direct_freekicks_order")) else int(row["direct_freekicks_order"]),
+            "corners_and_indirect_freekicks_order": (
+                None if pd.isna(row.get("corners_and_indirect_freekicks_order")) else int(row["corners_and_indirect_freekicks_order"])
+            ),
         }
     return lookup
 
@@ -99,6 +104,9 @@ def build_bootstrap(merged_gw: pd.DataFrame, teams: pd.DataFrame, points_per_gam
                 "points_per_game": prior["points_per_game"],
                 "starts": prior.get("starts", 0),
                 "ep_next": float(row["xP"]) if pd.notna(row["xP"]) else prior["points_per_game"],
+                "penalties_order": prior.get("penalties_order"),
+                "direct_freekicks_order": prior.get("direct_freekicks_order"),
+                "corners_and_indirect_freekicks_order": prior.get("corners_and_indirect_freekicks_order"),
             }
         )
 
@@ -142,8 +150,11 @@ def score_window(starting_ids, captain_id, merged_gw, gw_range) -> int:
     return total + captain_points
 
 
-def run_static_test(bootstrap, fixtures_list, merged_gw, horizon_gws, label):
-    df = model.project_players(bootstrap, fixtures_list, horizon=len(horizon_gws))
+def run_static_test(bootstrap, fixtures_list, merged_gw, horizon_gws, label, fixture_mode="fdr", set_piece_bonus=False, ep_next_weight=1.0):
+    df = model.project_players(
+        bootstrap, fixtures_list, horizon=len(horizon_gws), fixture_mode=fixture_mode, set_piece_bonus=set_piece_bonus,
+        ep_next_weight=ep_next_weight,
+    )
     result = optimizer.optimize_squad(df, budget=model.BUDGET_TENTHS)
     real_score = score_window(result.starting_ids, result.captain_id, merged_gw, horizon_gws)
     print(f"\n{label}")
@@ -154,8 +165,8 @@ def run_static_test(bootstrap, fixtures_list, merged_gw, horizon_gws, label):
     return result, real_score
 
 
-def run_dynamic_test(merged_gw, teams, fixtures_list, prior_lookup):
-    print("\nDYNAMIC TEST: re-optimizes every 5 gameweeks using only realized results so far")
+def run_dynamic_test(merged_gw, teams, fixtures_list, prior_lookup, fixture_mode="fdr", ep_next_weight=1.0):
+    print(f"\nDYNAMIC TEST ({fixture_mode}): re-optimizes every 5 gameweeks using only realized results so far")
     checkpoints = list(range(1, 39, RECHECK_EVERY_GW))
     old_squad_ids = None
     total_score = 0
@@ -168,7 +179,7 @@ def run_dynamic_test(merged_gw, teams, fixtures_list, prior_lookup):
         horizon = window_end - gw
         if horizon <= 0:
             break
-        df = model.project_players(bootstrap, fixtures_list, horizon=horizon)
+        df = model.project_players(bootstrap, fixtures_list, horizon=horizon, fixture_mode=fixture_mode, ep_next_weight=ep_next_weight)
         # Only players who actually appear at this checkpoint's snapshot are eligible.
         eligible_ids = set(df["id"])
         constrained_old = [i for i in (old_squad_ids or []) if i in eligible_ids]
@@ -205,6 +216,10 @@ def main() -> None:
     parser.add_argument("--prior", default="2024-25")
     parser.add_argument("--current", default="2025-26")
     parser.add_argument("--skip-dynamic", action="store_true")
+    parser.add_argument(
+        "--fixture-mode", choices=["fdr", "strength", "both"], default="both",
+        help="Fixture-difficulty method to test: FPL's FDR, the team-strength model, or both side by side (default).",
+    )
     args = parser.parse_args()
 
     print(f"Backtesting: prior season {args.prior} (data signal) -> current season {args.current} (real outcomes)")
@@ -215,11 +230,27 @@ def main() -> None:
     bootstrap_gw1 = build_bootstrap(merged_gw, teams, prior_lookup, as_of_gw=1)
     print(f"Reconstructed {len(bootstrap_gw1['elements'])} players active at the start of {args.current}.")
 
-    run_static_test(bootstrap_gw1, fixtures_list, merged_gw, range(1, 6), "STATIC, GW1-5 (matches the horizon quoted all night)")
-    run_static_test(bootstrap_gw1, fixtures_list, merged_gw, range(1, 39), "STATIC, full season, ZERO transfers (the honest floor)")
+    modes = ["fdr", "strength"] if args.fixture_mode == "both" else [args.fixture_mode]
+    for mode in modes:
+        run_static_test(
+            bootstrap_gw1, fixtures_list, merged_gw, range(1, 6),
+            f"STATIC, GW1-5, fixture_mode={mode}", fixture_mode=mode,
+        )
+        run_static_test(
+            bootstrap_gw1, fixtures_list, merged_gw, range(1, 39),
+            f"STATIC, full season, ZERO transfers, fixture_mode={mode}", fixture_mode=mode,
+        )
+        if not args.skip_dynamic:
+            run_dynamic_test(merged_gw, teams, fixtures_list, prior_lookup, fixture_mode=mode)
 
-    if not args.skip_dynamic:
-        run_dynamic_test(merged_gw, teams, fixtures_list, prior_lookup)
+    # set_piece_bonus only tested on the GW1 static snapshot: order data isn't
+    # tracked per-gameweek in the free archive, only as a season-level snapshot
+    # carried forward from the prior season (same limitation as PPG at GW1,
+    # but there's no in-season equivalent of running_ppg_lookup for it).
+    run_static_test(
+        bootstrap_gw1, fixtures_list, merged_gw, range(1, 6),
+        "STATIC, GW1-5, set_piece_bonus=True", set_piece_bonus=True,
+    )
 
 
 if __name__ == "__main__":

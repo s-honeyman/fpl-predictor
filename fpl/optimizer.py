@@ -40,7 +40,13 @@ def optimize_squad(
     to keep at least (SQUAD_SIZE - max_transfers) players from the old
     squad - used for in-season transfer suggestions.
     """
-    pool = df[df["availability"] > 0].copy()
+    # Players already owned stay eligible even if now unavailable: holding is
+    # always possible in real FPL, and excluding an injured held player made
+    # the max_transfers=0 baseline infeasible and crashed `fpl transfers`.
+    # Their predicted_points already scale to ~0 with availability, so the
+    # solver benches them naturally.
+    owned = set(old_squad_ids or [])
+    pool = df[(df["availability"] > 0) | df["id"].isin(owned)].copy()
     ids = pool["id"].tolist()
     if len(ids) < m.SQUAD_SIZE:
         raise RuntimeError("Not enough available players to fill a squad.")

@@ -10,15 +10,43 @@ from .optimizer import SquadResult, optimize_squad
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
 
 
+def _warn_if_gameweek_in_progress(bootstrap: dict, fixtures: list[dict]) -> None:
+    """FPL resets points_per_game/starts for the whole player pool at the
+    start of each gameweek, then fills them in fixture-by-fixture as matches
+    are actually played - not all at once. Mid-gameweek, that means players
+    whose match already happened show real (possibly inflated-looking)
+    stats while everyone else still shows zero, purely because of kickoff
+    order, not real form. `_shrink_ppg` has no way to tell "hasn't played
+    yet" apart from "played and returned zero", so projections (and any
+    transfer/captaincy suggestion built on them) are unreliable until the
+    whole gameweek is actually finished. Learned this the hard way - a
+    mid-gameweek `fpl transfers` run once dropped Haaland from captain
+    purely because Man City hadn't kicked off yet while Arsenal had."""
+    current = next((e for e in bootstrap["events"] if not model._gameweek_effectively_finished(e["id"], e, fixtures)), None)
+    if current is None:
+        return
+    gw_fixtures = [f for f in fixtures if f.get("event") == current["id"]]
+    any_started = any(f.get("started") for f in gw_fixtures)
+    if any_started:
+        played = sum(1 for f in gw_fixtures if f.get("started"))
+        print(
+            f"WARNING: GW{current['id']} is in progress ({played}/{len(gw_fixtures)} fixtures started, "
+            f"not finished) - projections and any transfer/captaincy suggestion below are unreliable "
+            f"right now (players whose match hasn't kicked off yet look artificially worse than players "
+            f"who've already played). Wait until GW{current['id']} is fully finished before acting on this."
+        )
+
+
 def _load_projections(horizon: int, refresh: bool) -> tuple[pd.DataFrame, dict]:
     bootstrap = api.get_bootstrap(force_refresh=refresh)
     fixtures = api.get_fixtures(force_refresh=refresh)
+    _warn_if_gameweek_in_progress(bootstrap, fixtures)
     df = model.project_players(bootstrap, fixtures, horizon=horizon)
-    _sync_prediction_log(bootstrap, df)
+    _sync_prediction_log(bootstrap, fixtures, df)
     return df, bootstrap
 
 
-def _sync_prediction_log(bootstrap: dict, df: pd.DataFrame) -> None:
+def _sync_prediction_log(bootstrap: dict, fixtures: list[dict], df: pd.DataFrame) -> None:
     """The 'get smarter every gameweek' mechanism (see prediction_log.py):
     logs this run's next-gameweek predictions, and fills in real results for
     any previously-logged gameweek that's since finished. Runs automatically
@@ -35,7 +63,7 @@ def _sync_prediction_log(bootstrap: dict, df: pd.DataFrame) -> None:
         if added:
             print(f"(logged {added} predictions for GW{next_gw} - checked against reality once it's played)")
 
-    finished_gws = {e["id"] for e in bootstrap["events"] if e["finished"]}
+    finished_gws = {e["id"] for e in bootstrap["events"] if model._gameweek_effectively_finished(e["id"], e, fixtures)}
     for gw in prediction_log.gameweeks_needing_actuals(finished_gws):
         live = api.get_gameweek_live(gw)
         actuals = {el["id"]: el["stats"]["total_points"] for el in live["elements"]}
@@ -94,7 +122,16 @@ def cmd_transfers(args: argparse.Namespace) -> None:
 
     df, _bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh)
     old_ids = saved["squad_ids"]
-    budget = saved["total_cost"] + saved.get("bank_tenths", 0)
+    # Budget must reflect the squad's CURRENT live value, not the stale price
+    # it was bought at - prices drift daily (a held player who's risen in
+    # price makes "hold everything" look infeasible under the old total,
+    # even though holding never costs anything new). Real FPL selling price
+    # is actually current value minus half of any profit, which needs a
+    # per-entry API call we don't have without a linked FPL team ID - using
+    # full current value is a slight overestimate of real buying power, but
+    # never an underestimate, so it can't cause the same false-infeasible bug.
+    current_squad_value = int(df[df["id"].isin(old_ids)]["now_cost"].sum())
+    budget = current_squad_value + saved.get("bank_tenths", 0)
 
     baseline = optimize_squad(df, budget=budget, old_squad_ids=old_ids, max_transfers=0)
 

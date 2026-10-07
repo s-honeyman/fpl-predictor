@@ -112,6 +112,25 @@ The caveat above (season PPG using more games than the 5-match recent-form windo
 
 **Practical conclusion for any paid data source under consideration:** advanced attacking-stats APIs (Sportmonks, TheStatsAPI, FootyStats, and similar) would mostly deliver more of a signal type now validated twice as weak here. The two paid options that plausibly *would* help, because they're a genuinely different kind of signal, not more of the same: **confirmed starting lineups** (targets our proven weak point - minutes/starts reliability, see the breakout-screen findings above) and **player prop betting odds** (market-synthesized probability, same logic as `pl-club-forecast`'s bookmaker-ceiling comparison). Neither implemented yet - a real next step, not a promise.
 
+## Investigated: does a data-driven team-strength model beat FPL's own FDR? (`fpl/team_strength.py`)
+
+Real question raised: FPL's fixture-difficulty rating (FDR) is a subjective 1-5 integer FPL sets themselves - is a data-driven alternative better? Built one: `fpl/team_strength.py` (ported from `pl-club-forecast`'s `compute_team_strengths`) blends each team's top-18-player last-season output and current transfer-market value into a standardized strength z-score, then converts the strength *differential* between a player's team and their specific opponent into a fixture multiplier (`fpl/model.py`'s `_fixture_strength_multiplier`, selectable via `project_players(..., fixture_mode="strength")`).
+
+Tested head-to-head against FDR via `scripts/backtest_season.py --fixture-mode both` (2024-25 → 2025-26, GW1-5 static squad):
+
+| Fixture-difficulty method | Model's own projection | ACTUAL realized points |
+|---|---|---|
+| FPL's FDR (what the model already uses) | 290.4 | **242** |
+| Team-strength differential | 326.3 | 183 |
+
+**Honest result: worse, not better - and not a calibration problem.** Grid-searched the multiplier's scale from 0.0 (fixtures effectively ignored) to 0.25: every setting underperformed FDR, including the flat baseline. That means FPL's FDR is already encoding real information - likely per-fixture attack/defense splits and in-season updates - that a static, season-total-based strength blend doesn't capture. `fixture_mode` defaults to `"fdr"` and stays there; `"strength"` is kept in the code as a documented, tested-and-rejected alternative, not deleted, in case a better-informed strength signal (e.g. one built from actual goals-for/against rather than points/price) is worth trying later.
+
+## Investigated: does a set-piece taker bonus help? (`fpl/model.py`'s `SET_PIECE_BONUS`)
+
+`points_per_game` is a trailing average - it gives a new penalty/free-kick/corner taker zero credit for that role until they've actually scored some, even though the expected-points math is knowable from the role alone. Added a small, explicitly-not-fitted per-fixture bonus for nominated takers (`project_players(..., set_piece_bonus=True)`, using FPL's own `penalties_order`/`direct_freekicks_order`/`corners_and_indirect_freekicks_order` fields, which the model previously ignored entirely) and tested it head-to-head against the baseline on the same GW1-5 static backtest.
+
+**Result: inconclusive, not a clean win.** With the bonus on, the optimizer selected the *exact same squad* and realized the *exact same 242 points* - the bonus values (0.3 pts/game for a primary penalty taker, smaller for the rest) were too small to change any selection decision, because the players who'd benefit most (Haaland, Salah, Palmer-tier) are already picked on `points_per_game` alone, which already implicitly reflects the penalties/set-pieces they converted historically. This test can't distinguish "the signal doesn't matter" from "the test isn't sensitive enough to see it" - a better test would compare similarly-priced/PPG players who differ only in set-piece duty, not just check whether the top-15 squad changes. Left in the code as an explicit, documented, **off-by-default** option (`set_piece_bonus=False`) rather than either deleting it or claiming it's proven - exactly the standard held for the fixture-strength experiment above.
+
 ## Prediction log + recalibration - the real "get smarter every gameweek" mechanism (`fpl/prediction_log.py`, `scripts/recalibrate.py`)
 
 Explicitly not MiroFish's Zep-based memory (LLM-agent conversational/episodic memory - the wrong tool for a numeric regression problem, see the original design discussion). The correct, standard analog: a growing, append-only log of predicted-vs-actual results per player per gameweek, and a recalibration step that re-checks (and can suggest re-tuning) `SHRINKAGE_K` against real accumulated error - genuinely learning from what's happened, not from a knowledge graph.

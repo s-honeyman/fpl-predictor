@@ -69,7 +69,7 @@ def main() -> None:
         )
         return sum(
             shrunk * model._fixture_difficulty_multiplier(d) * avail
-            for d, _home in fixture_lookup.get(player["team"], {}).get(gw, [])
+            for d, _home, _opp in fixture_lookup.get(player["team"], {}).get(gw, [])
         )
 
     print("=" * 60)

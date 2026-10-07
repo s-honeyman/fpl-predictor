@@ -21,7 +21,12 @@ def save_squad(result: SquadResult, bank_tenths: int = 0, saved_at: str | None =
         "captain_id": result.captain_id,
         "vice_captain_id": result.vice_captain_id,
         "total_cost": result.total_cost,
-        "bank_tenths": bank_tenths,
+        # Never negative: a squad whose live value has risen past its original
+        # budget has zero bank, not negative bank - a negative value here once
+        # silently made `optimize_squad`'s "hold everything" case infeasible,
+        # since callers add this straight back onto live squad value to get
+        # the optimizer's budget (see cli.py's cmd_transfers).
+        "bank_tenths": max(0, bank_tenths),
         "saved_at": saved_at or datetime.now(timezone.utc).isoformat(),
     }
     STATE_PATH.write_text(json.dumps(payload, indent=2))
