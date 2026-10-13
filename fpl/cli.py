@@ -4,7 +4,7 @@ import argparse
 
 import pandas as pd
 
-from . import api, league, live, model, prediction_log, squad_state, team_ratings
+from . import api, league, live, model, player_model, prediction_log, squad_state, team_ratings
 from .optimizer import SquadResult, optimize_squad
 
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
@@ -37,11 +37,29 @@ def _warn_if_gameweek_in_progress(bootstrap: dict, fixtures: list[dict]) -> None
         )
 
 
-def _load_projections(horizon: int, refresh: bool) -> tuple[pd.DataFrame, dict]:
+# First-gameweek weight on FPL's own ep_next in the decomposed model: FPL's
+# number knows injury/suspension news our history can't (backtest: blending it
+# lifted next-week ranking quality); later gameweeks are pure decomposition.
+FIRST_WEEK_FPL_WEIGHT = 0.5
+
+
+def _load_projections(horizon: int, refresh: bool, kind: str = "decomposed") -> tuple[pd.DataFrame, dict]:
     bootstrap = api.get_bootstrap(force_refresh=refresh)
     fixtures = api.get_fixtures(force_refresh=refresh)
     _warn_if_gameweek_in_progress(bootstrap, fixtures)
     df = model.project_players(bootstrap, fixtures, horizon=horizon)
+    if kind == "decomposed":
+        by_id = {p["id"]: p for p in bootstrap["elements"]}
+        now = {i: model._availability_multiplier(p) for i, p in by_id.items()}
+        later = {i: model._later_gameweek_availability(p) for i, p in by_id.items()}
+        proj = player_model.live_projection(bootstrap, fixtures, df.attrs["gameweeks"], now, later)
+        w = FIRST_WEEK_FPL_WEIGHT
+        df["model_next_gw"] = df["id"].map(lambda i: round(proj[i][1], 3))
+        df["predicted_points"] = [
+            round(proj[i][0] - proj[i][1] + (1 - w) * proj[i][1] + w * ep * a, 2)
+            for i, ep, a in zip(df["id"], df["ep_next"], df["availability"])
+        ]
+    df.attrs["model"] = kind
     _sync_prediction_log(bootstrap, fixtures, df)
     return df, bootstrap
 
@@ -112,7 +130,7 @@ def _print_squad(df: pd.DataFrame, result: SquadResult) -> None:
 
 
 def cmd_build(args: argparse.Namespace) -> None:
-    df, _bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh)
+    df, _bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh, kind=args.model)
     result = optimize_squad(df, budget=int(args.budget * 10))
     _print_squad(df, result)
     if not args.no_save:
@@ -150,7 +168,7 @@ def _team_source_line(team: live.LiveTeam) -> str:
 
 
 def cmd_transfers(args: argparse.Namespace) -> None:
-    df, bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh)
+    df, bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh, kind=args.model)
     team = _live_team(args, bootstrap)
     if team is not None:
         old_ids, bank = list(team.squad_ids), team.bank_tenths
@@ -239,7 +257,7 @@ def cmd_league(args: argparse.Namespace) -> None:
     cfg = live.load_config()
     if not cfg or not cfg.get("league_id"):
         raise SystemExit("Link your team and league first: `fpl sync --entry <id> --league <id>`")
-    df, bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh)
+    df, bootstrap = _load_projections(horizon=args.horizon, refresh=args.refresh, kind=args.model)
     fixtures = api.get_fixtures()
     team = _live_team(args, bootstrap)
     managers = _managers(args, team)
@@ -305,6 +323,9 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=5, help="Number of upcoming gameweeks to project over (default 5).")
     parser.add_argument("--refresh", action="store_true", help="Force-refresh cached FPL API data.")
     parser.add_argument("--no-save", action="store_true", help="Don't persist the result as your current squad.")
+    parser.add_argument("--model", choices=["decomposed", "classic"], default="decomposed",
+                        help="decomposed (default): minutes x goals/assists/clean sheets per fixture; "
+                             "classic: points-per-game x FDR.")
 
     sub = parser.add_subparsers(dest="command", required=True)
 

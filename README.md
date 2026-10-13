@@ -165,3 +165,24 @@ Backtested with no lookahead on two seasons:
 ## Mini-league awareness (`fpl/league.py`, `fpl league`)
 
 Compares your squad against your real rivals': standings, each squad's projected strength (best XI + captain this model would pick from their current 15), a rough simulated chance of finishing top, and ownership - players every rival owns that you don't, players one rival owns, and your differentials. It deliberately doesn't claim that owning rivals' players raises your expected lead (their teams are fixed when you choose, so your expected gap moves only with your own expected points). What ownership changes is risk: a player all your rivals own is one you're short on, a player none own is pure leverage - worth leaning toward among near-equal options when behind, and away from when ahead. Transfer suggestions are tagged with rival ownership.
+
+## The decomposed model - now the default (`fpl/player_model.py`, `scripts/backtest_player_model.py`)
+
+The original projection multiplies FPL's `points_per_game` by a fixture factor. Two structural problems, both found in real decisions this season:
+- `points_per_game` is per **appearance**, not per gameweek, so a rotation player (2 appearances, 20 points) projects like a nailed-on 10-a-week star. This is also why the original model ran ~20% hot all along.
+- One fixture factor scales every point a player scores, though a tough fixture hits a defender's clean sheet and a forward's goals differently.
+
+The decomposed model projects each player-fixture as P(60+ minutes) x [appearance + goals and assists from his expected-goals/assists rates scaled by his team's expected goals in that fixture + clean-sheet chance - goals-conceded penalty + his usual bonus/defensive/other points] + P(short appearance) x typical sub points. Minutes come from his recent share of his team's matches (recency-weighted, shrunk toward last season); fixtures from the goals model.
+
+Backtested with no lookahead, ~17,000 player-gameweeks per season:
+
+| | Rank corr. 2024-25 | Rank corr. 2025-26 | Bias (pts/player/GW) | Season sim 2024-25 | Season sim 2025-26 |
+|---|---|---|---|---|---|
+| Original (PPG x FDR) | 0.182 | 0.132 | +1.3 to +1.5 | 2103 | 1933 |
+| **Decomposed** | **0.592** | **0.570** | **~0** | **2132** | **1944** |
+
+The only tuned constants are the minutes prior for unknown players (tuned on 2024-25, confirmed on 2025-26). An untuned version scored higher in the season simulation (2201 / 1948) but lower on prediction quality; the simulation is a single noisy path, so the larger prediction-quality sample decided it.
+
+**FPL's own estimate still knows things history can't.** In the archive, FPL's per-gameweek `xP` ranks players better again (0.74), largely because it marks injured/suspended players as 0 - and it may have been recorded after team news, which a model run before the deadline can't have. (The 2025-26 archive is missing `xP` for 82% of rows, so that season's comparison isn't usable.) So live projections blend 50/50 with FPL's `ep_next` for the first gameweek only, and use the decomposition for every later week. The live prediction log records both this model's number and FPL's pre-deadline one, which will settle which is better without any look-ahead risk.
+
+`--model classic` reverts to the original projection.
