@@ -11,7 +11,10 @@ error once enough of it exists. Same spirit ("learn from what's happened"),
 right tool for this specific job.
 
 Log format: append-only JSON Lines (data/prediction_log.jsonl), one entry per
-(gameweek, player). `record_predictions` writes the predicted side as soon as
+(gameweek, player). `predicted_points` is FPL's own `ep_next` (kept for
+continuity - it was the only number logged through GW6); `model_points` is this
+model's own next-gameweek projection, logged from GW7 onward. Measure the
+model on `model_points`, not `predicted_points`. `record_predictions` writes the predicted side as soon as
 a gameweek is projected; `record_actuals` fills in the real side once that
 gameweek has actually been played.
 """
@@ -50,22 +53,33 @@ def record_predictions(df: pd.DataFrame, gw: int) -> int:
     predicted BEFORE the result was known, not to let hindsight sneak in).
     Returns how many new entries were written."""
     existing = _load_raw()
-    already_logged = {(e["gw"], e["player_id"]) for e in existing}
+    by_key = {(e["gw"], e["player_id"]): e for e in existing}
+    has_model = "model_points" in df.columns
 
     new_entries = []
+    backfilled = False
     for _, row in df.iterrows():
         key = (gw, int(row["id"]))
-        if key in already_logged:
+        if key in by_key:
+            # Older entries only stored FPL's ep_next. Adding this model's own
+            # number is still honest as long as the result isn't known yet.
+            e = by_key[key]
+            if has_model and "model_points" not in e and e.get("actual_points") is None:
+                e["model_points"] = float(row["model_points"])
+                backfilled = True
             continue
-        new_entries.append(
-            {
-                "gw": gw,
-                "player_id": int(row["id"]),
-                "web_name": row["web_name"],
-                "predicted_points": float(row["predicted_points"]),
-                "actual_points": None,
-            }
-        )
+        entry = {
+            "gw": gw,
+            "player_id": int(row["id"]),
+            "web_name": row["web_name"],
+            "predicted_points": float(row["predicted_points"]),
+            "actual_points": None,
+        }
+        if has_model:
+            entry["model_points"] = float(row["model_points"])
+        new_entries.append(entry)
+    if backfilled:
+        _rewrite(existing)
     if new_entries:
         LOG_PATH.parent.mkdir(exist_ok=True)
         with LOG_PATH.open("a") as f:
@@ -74,14 +88,16 @@ def record_predictions(df: pd.DataFrame, gw: int) -> int:
     return len(new_entries)
 
 
-def record_actuals(gw: int, actuals_by_player_id: dict[int, float]) -> int:
-    """Fills in actual_points for a gameweek's already-logged predictions.
-    Returns how many entries were updated."""
+def record_actuals(gw: int, actuals_by_player_id: dict[int, float], minutes_by_player_id: dict[int, int] | None = None) -> int:
+    """Fills in actual_points (and minutes, if given) for a gameweek's
+    already-logged predictions. Returns how many entries were updated."""
     entries = _load_raw()
     updated = 0
     for e in entries:
         if e["gw"] == gw and e.get("actual_points") is None and e["player_id"] in actuals_by_player_id:
             e["actual_points"] = actuals_by_player_id[e["player_id"]]
+            if minutes_by_player_id is not None:
+                e["actual_minutes"] = minutes_by_player_id.get(e["player_id"], 0)
             updated += 1
     if updated:
         _rewrite(entries)

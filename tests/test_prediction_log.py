@@ -81,3 +81,18 @@ def test_load_completed_log_excludes_pending_entries():
     completed = prediction_log.load_completed_log()
     assert len(completed) == 1
     assert completed[0]["player_id"] == 1
+
+
+def test_model_points_recorded_and_backfilled_only_before_result():
+    df = _df([{"id": 1, "web_name": "Haaland", "predicted_points": 8.0}])
+    prediction_log.record_predictions(df, gw=7)
+    df2 = _df([{"id": 1, "web_name": "Haaland", "predicted_points": 8.0, "model_points": 6.5}])
+    prediction_log.record_predictions(df2, gw=7)
+    assert prediction_log._load_raw()[0]["model_points"] == 6.5
+
+    prediction_log.record_predictions(df, gw=8)
+    prediction_log.record_actuals(8, {1: 2.0}, {1: 90})
+    prediction_log.record_predictions(_df([{"id": 1, "web_name": "Haaland", "predicted_points": 8.0, "model_points": 9.9}]), gw=8)
+    gw8 = [e for e in prediction_log._load_raw() if e["gw"] == 8][0]
+    assert "model_points" not in gw8  # no hindsight backfill once the result is known
+    assert gw8["actual_minutes"] == 90

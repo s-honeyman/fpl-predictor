@@ -40,6 +40,22 @@ def get_fixtures(force_refresh: bool = False) -> list[dict]:
     return _cached_get(f"{BASE_URL}/fixtures/", "fixtures.json", force_refresh)
 
 
+ARCHIVE_URL = "https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data"
+ARCHIVE_CACHE = DATA_DIR / "backtests"
+
+
+def get_archive_csv(path: str, cache_name: str) -> Path:
+    """A file from the vaastav/Fantasy-Premier-League season archive, cached
+    forever (past seasons don't change). Same cache as scripts/backtest_season.py."""
+    ARCHIVE_CACHE.mkdir(parents=True, exist_ok=True)
+    cache_path = ARCHIVE_CACHE / cache_name
+    if not cache_path.exists():
+        response = requests.get(f"{ARCHIVE_URL}/{path}", timeout=60)
+        response.raise_for_status()
+        cache_path.write_bytes(response.content)
+    return cache_path
+
+
 def get_gameweek_live(gw: int, force_refresh: bool = False) -> dict:
     """Every player's actual stats for one specific (finished or in-progress)
     gameweek - one call for the whole league, not one per player. Used to

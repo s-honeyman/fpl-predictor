@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from . import team_strength
+from . import team_ratings, team_strength
 
 # Position id -> short name, and squad/formation rules (from bootstrap's element_types).
 POSITIONS = {
@@ -209,6 +209,7 @@ def next_gameweeks(bootstrap: dict, fixtures: list[dict], horizon: int) -> list[
 def project_players(
     bootstrap: dict, fixtures: list[dict], horizon: int = 5,
     fixture_mode: str = "fdr", set_piece_bonus: bool = False, ep_next_weight: float = 1.0,
+    goals_model: tuple | None = None,
 ) -> pd.DataFrame:
     """Return a DataFrame with one row per player and a `predicted_points` column
     summing projected points across the next `horizon` gameweeks.
@@ -223,13 +224,19 @@ def project_players(
     penalty/free-kick/corner takers. Off by default - not yet proven to help,
     same status as fixture_mode="strength". Validate before switching it on.
 
+    `goals_model`: (TeamRatings, position weights) from fpl/team_ratings.py,
+    required for fixture_mode="goals" - per-fixture expected goals and
+    clean-sheet odds, applied per position instead of one FDR discount.
+
     `ep_next_weight`: how much of the FIRST gameweek's estimate comes from
     FPL's `ep_next` (1.0 = all of it, today's default) vs this model's own
     shrunk-PPG x fixture-difficulty figure (0.0). In live data ep_next equals
     FPL's `form` (a ~2-game average mid-season), so it's un-shrunk recent
     form - see scripts/backtest_season.py --ep-weight for how it was tested."""
-    if fixture_mode not in ("fdr", "strength"):
-        raise ValueError(f"fixture_mode must be 'fdr' or 'strength', got {fixture_mode!r}")
+    if fixture_mode not in ("fdr", "strength", "goals"):
+        raise ValueError(f"fixture_mode must be 'fdr', 'strength' or 'goals', got {fixture_mode!r}")
+    if fixture_mode == "goals" and goals_model is None:
+        raise ValueError("fixture_mode='goals' needs goals_model=(TeamRatings, position_weights)")
 
     teams = {t["id"]: t for t in bootstrap["teams"]}
     fixture_lookup = build_team_fixture_lookup(fixtures)
@@ -257,11 +264,17 @@ def project_players(
             for difficulty, is_home, opponent_id in team_fixtures.get(gw, []):
                 if fixture_mode == "strength":
                     multiplier = _fixture_strength_multiplier(strength_z[team_id], strength_z[opponent_id], is_home)
+                elif fixture_mode == "goals":
+                    ratings, weights = goals_model
+                    multiplier = team_ratings.fixture_multiplier(
+                        ratings, weights, team_id, opponent_id, is_home, player["element_type"]
+                    )
                 else:
                     multiplier = _fixture_difficulty_multiplier(difficulty)
                 total += (shrunk_ppg * multiplier + bonus_per_fixture) * avail
             return total
 
+        model_next_gw = fixture_points(gameweeks[0], availability)
         ep_term = float(player.get("ep_next") or 0.0) * availability
         if ep_next_weight >= 1.0:
             predicted = ep_term
@@ -292,6 +305,7 @@ def project_players(
                 "shrunk_points_per_game": round(shrunk_ppg, 3),
                 "starts": starts,
                 "ep_next": float(player.get("ep_next") or 0.0),
+                "model_next_gw": round(model_next_gw, 3),
                 "fixtures_in_horizon": num_fixtures_in_horizon,
                 "predicted_points": round(predicted, 2),
             }

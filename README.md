@@ -14,9 +14,13 @@ Fully standalone - the FPL API is public, no API key needed.
 ## Usage
 
 ```bash
-uv run fpl build                          # initial squad (e.g. for gameweek 1)
-uv run fpl transfers --free-transfers 1   # each gameweek: best transfer(s), or hold
+uv run fpl build                                      # initial squad (e.g. for gameweek 1)
+uv run fpl sync --entry <team id> --league <league id> # once: link your real FPL team + mini-league
+uv run fpl transfers                                  # each gameweek: best transfer(s), or hold
+uv run fpl league                                     # gaps, squad strength, rival ownership, fixture odds
 ```
+
+Once linked, `transfers` and `league` read your real team from FPL's public API instead of a hand-maintained file, and work out your free transfers from your history. FPL only publishes picks as of the last deadline, so pass moves you've already made with `--pending "Out>In"`. Player names that clash (three Wilsons, two Hendersons) are refused rather than guessed - use `Name:TEAM`. The ids live in `data/league.json`, which is git-ignored: this repo is public and those ids resolve to real names.
 
 ## Backtested against two real completed seasons - and the honest result
 
@@ -136,10 +140,28 @@ Tested head-to-head against FDR via `scripts/backtest_season.py --fixture-mode b
 Explicitly not MiroFish's Zep-based memory (LLM-agent conversational/episodic memory - the wrong tool for a numeric regression problem, see the original design discussion). The correct, standard analog: a growing, append-only log of predicted-vs-actual results per player per gameweek, and a recalibration step that re-checks (and can suggest re-tuning) `SHRINKAGE_K` against real accumulated error - genuinely learning from what's happened, not from a knowledge graph.
 
 **How it works, automatically, on every run:**
-1. Every `fpl build`/`fpl transfers` call logs that run's next-gameweek prediction for every player (`ep_next * availability` specifically - the model's actual single-gameweek estimate, not the multi-gameweek horizon sum shown in `predicted_points`). Idempotent - re-running for the same gameweek doesn't duplicate or let hindsight leak into an already-logged prediction.
+1. Every `fpl build`/`fpl transfers` call logs that run's next-gameweek prediction for every player. **Correction (GW7):** through GW6 the only number logged was FPL's own `ep_next`, not this model's projection - so the accuracy figures reported for GW1-6 measured FPL's estimate, not ours, and couldn't have told us anything about `SHRINKAGE_K`. From GW7 each entry also stores `model_points` (this model's shrunk-PPG x fixture estimate) and actual minutes; `recalibrate.py` now judges the model only on `model_points`. Idempotent - re-running for the same gameweek doesn't duplicate or let hindsight leak into an already-logged prediction.
 2. The same call checks which previously-logged gameweeks have since finished (per FPL's own `events[].finished` flag) and fetches real results for them via `GET /event/{gw}/live/` (one call for the whole league, not one per player) - filling in the log's `actual_points` field.
 3. `scripts/recalibrate.py` reads the log once at least 5 real gameweeks have completed (deliberately not sooner - a handful of gameweeks is too noisy to act on), reports real in-season accuracy (MAE, bias, correlation), and suggests - for manual review, never auto-applied - whether `SHRINKAGE_K` should move.
 
 Run `uv run python scripts/recalibrate.py` periodically (natural to pair with the 4-gameweek replanning cadence).
 
 **Honest state as of writing:** the mechanism is built and tested (`tests/test_prediction_log.py`, 7 tests, all against synthetic data via an isolated log fixture - never touches the real log file). It cannot yet be exercised against real accumulated data because the 2026-27 season hasn't started - `scripts/recalibrate.py` currently and correctly reports "0 completed gameweeks, need 5 more" against the real log. This will start accumulating real value once GW1 is actually played.
+
+## Investigated: a goals-based fixture model (`fpl/team_ratings.py`, `scripts/backtest_goals_model.py`)
+
+Built because several real decisions were being made by eye ("Forest never score at home", "Chelsea score in every game"). It's an independent-Poisson model of each team's attack and defence, fitted with a ridge penalty from this season's scorelines plus last season's at half weight (promoted teams start from last season's relegated sides). It gives expected goals and clean-sheet odds per fixture, applied per position: only the clean-sheet share of a defender's points and only the attacking share of a forward's points move with the fixture, with those shares measured from a full season's data.
+
+Backtested with no lookahead on two seasons:
+
+| | 2024-25 rank corr. | 2025-26 rank corr. | Season sim 2024-25 | Season sim 2025-26 |
+|---|---|---|---|---|
+| No fixture adjustment | 0.182 | 0.142 | - | - |
+| FPL's FDR (default) | **0.194** | **0.156** | **2103** | 1933 |
+| Goals model | 0.194 | 0.153 | 2077 | **2001** |
+
+**Honest result: a tie with FDR, not an improvement.** Scaling its effect up made it worse at every setting, and a 50/50 blend with FDR also tied. FDR stays the default (`fixture_mode="goals"` is available). The more useful finding is underneath: fixture adjustment of *any* kind barely moves how well players are ranked (0.182 → 0.194), so the bigger gains have to come from player-level signals - minutes and attacking involvement - not from rating fixtures more cleverly. The model still earns a place as information: `fpl league` prints its clean-sheet odds and expected goals for your clubs' next fixtures.
+
+## Mini-league awareness (`fpl/league.py`, `fpl league`)
+
+Compares your squad against your real rivals': standings, each squad's projected strength (best XI + captain this model would pick from their current 15), a rough simulated chance of finishing top, and ownership - players every rival owns that you don't, players one rival owns, and your differentials. It deliberately doesn't claim that owning rivals' players raises your expected lead (their teams are fixed when you choose, so your expected gap moves only with your own expected points). What ownership changes is risk: a player all your rivals own is one you're short on, a player none own is pure leverage - worth leaning toward among near-equal options when behind, and away from when ahead. Transfer suggestions are tagged with rival ownership.

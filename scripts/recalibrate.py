@@ -41,17 +41,28 @@ def main() -> None:
         )
         return
 
-    predicted = np.array([e["predicted_points"] for e in completed])
-    actual = np.array([e["actual_points"] for e in completed])
+    def report(label: str, key: str, entries: list[dict]) -> float | None:
+        if not entries:
+            print(f"\n{label}: no logged entries yet.")
+            return None
+        predicted = np.array([e[key] for e in entries])
+        actual = np.array([e["actual_points"] for e in entries])
+        bias = float(np.mean(predicted - actual))
+        corr = float(np.corrcoef(predicted, actual)[0, 1]) if len(predicted) > 1 else float("nan")
+        print(f"\n{label} ({len({e['gw'] for e in entries})} gameweek(s), {len(entries)} predictions):")
+        print(f"  Mean absolute error: {float(np.mean(np.abs(predicted - actual))):.2f} pts/player/gameweek")
+        print(f"  Bias: {bias:+.2f} ({'over' if bias > 0 else 'under'}-projecting on average)")
+        print(f"  Correlation (predicted vs. actual): {corr:.3f}")
+        return bias
 
-    mae = float(np.mean(np.abs(predicted - actual)))
-    bias = float(np.mean(predicted - actual))  # positive = still over-projecting
-    corr = float(np.corrcoef(predicted, actual)[0, 1]) if len(predicted) > 1 else float("nan")
-
-    print(f"\nReal in-season accuracy so far:")
-    print(f"  Mean absolute error: {mae:.2f} pts/player/gameweek")
-    print(f"  Bias: {bias:+.2f} ({'over' if bias > 0 else 'under'}-projecting on average)")
-    print(f"  Correlation (predicted vs. actual): {corr:.3f}")
+    # Through GW6 only FPL's own ep_next was logged, so those numbers say
+    # nothing about this model - SHRINKAGE_K advice must come from model_points.
+    report("FPL's own ep_next (reference only)", "predicted_points", completed)
+    model_entries = [e for e in completed if "model_points" in e]
+    bias = report("THIS MODEL's own projection", "model_points", model_entries)
+    if bias is None or len({e["gw"] for e in model_entries}) < prediction_log.MIN_GAMEWEEKS_FOR_RECALIBRATION:
+        print("\nNot enough gameweeks of this model's own projections yet to advise on SHRINKAGE_K.")
+        return
 
     print(f"\nCurrent SHRINKAGE_K = {model.SHRINKAGE_K}")
     if abs(bias) > 1.0:
