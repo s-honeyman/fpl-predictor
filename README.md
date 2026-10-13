@@ -186,3 +186,21 @@ The only tuned constants are the minutes prior for unknown players (tuned on 202
 **FPL's own estimate still knows things history can't.** In the archive, FPL's per-gameweek `xP` ranks players better again (0.74), largely because it marks injured/suspended players as 0 - and it may have been recorded after team news, which a model run before the deadline can't have. (The 2025-26 archive is missing `xP` for 82% of rows, so that season's comparison isn't usable.) So live projections blend 50/50 with FPL's `ep_next` for the first gameweek only, and use the decomposition for every later week. The live prediction log records both this model's number and FPL's pre-deadline one, which will settle which is better without any look-ahead risk.
 
 `--model classic` reverts to the original projection.
+
+## Planning: transfers week by week, captaincy, chips (`fpl plan`, `fpl/planner.py`, `fpl/chips.py`, `scripts/backtest_planner.py`)
+
+`fpl plan` prints a week-by-week transfer plan, captain options for the next gameweek, and the value of each remaining chip by gameweek. Tested in a weekly replay of two full past seasons (decomposed projections, real free-transfer and -4 rules, no lookahead):
+
+| | 2024-25 | 2025-26 |
+|---|---|---|
+| One-shot transfers (`fpl transfers` logic) | 2330 (after -60 hits) | **1972** (after -56) |
+| Week-by-week planner | **2384** (no hits) | 1957 (no hits) |
+| Captain by highest average | 367 | **247** |
+| Captain by chance of 10+ points | 305 | 224 |
+| Captain by 90th-percentile score | **372** | 191 |
+
+- **Planner: mixed** (+54, -15). It times free transfers instead of paying for hits, but isn't proven to score more, so it's a timing view alongside `fpl transfers`, not a replacement. It never buys back a player its own plan sold.
+- **Captaincy: pick by average.** Chasing ceiling lost overall in both seasons, so `fpl plan` recommends the highest-average captain (this model's own number - FPL's estimate is shown beside it, not mixed in) and shows chance-of-10+ and 90th percentile only as information.
+- **Chips come in two sets this season** (read from FPL, not assumed): one of each for GW1-19, a fresh set for GW20-38; unused first-half chips are lost after GW19. Chip values (Bench Boost, Free Hit, Wildcard against the best normal-transfer plan) are projections, not backtested timing rules - they depend on blank and double gameweeks that FPL only schedules as cup ties get rearranged.
+
+Also from the weekly replay: managing every week with the decomposed model scored 2330/1972, against 2132/1944 when re-optimising every five weeks.

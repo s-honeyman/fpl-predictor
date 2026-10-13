@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import pandas as pd
 
-from . import api, league, live, model, player_model, prediction_log, squad_state, team_ratings
+from . import api, chips, league, live, model, planner, player_model, prediction_log, squad_state, team_ratings
 from .optimizer import SquadResult, optimize_squad
 
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
@@ -318,6 +319,91 @@ def cmd_league(args: argparse.Namespace) -> None:
                   f"clean sheet {ratings.clean_sheet_prob(club, opp, home):.0%}")
 
 
+def cmd_plan(args: argparse.Namespace) -> None:
+    bootstrap = api.get_bootstrap(force_refresh=args.refresh)
+    fixtures = api.get_fixtures(force_refresh=args.refresh)
+    _warn_if_gameweek_in_progress(bootstrap, fixtures)
+    team = _live_team(args, bootstrap)
+    if team is None:
+        raise SystemExit("`fpl plan` needs your linked FPL team: `fpl sync --entry <id> --league <id>`")
+    by_id = {p["id"]: p for p in bootstrap["elements"]}
+    names = {i: p["web_name"] for i, p in by_id.items()}
+    pos = {i: p["element_type"] for i, p in by_id.items()}
+    club = {i: p["team"] for i, p in by_id.items()}
+    price = {i: p["now_cost"] for i, p in by_id.items()}
+    upcoming = model.next_gameweeks(bootstrap, fixtures, 38)
+    hist = live.history(team.entry_id, args.refresh)
+    windows = chips.chip_windows(bootstrap, hist.get("chips", []))
+    first_half_end = min((c["stop"] for c in windows if c["start"] <= upcoming[0] <= c["stop"]), default=upcoming[0] + 4)
+    gws = [g for g in upcoming if g <= max(first_half_end, upcoming[0] + args.horizon - 1)]
+
+    now = {i: model._availability_multiplier(p) for i, p in by_id.items()}
+    later = {i: model._later_gameweek_availability(p) for i, p in by_id.items()}
+    h, lookup, ratings, priors, rates = player_model.live_inputs(bootstrap, fixtures)
+    params = player_model.fixture_params(bootstrap["elements"], h, lookup, gws, ratings, priors, rates, now, later)
+    proj = player_model.by_gameweek(params, gws)
+    model_first = {i: a[0] for i, a in proj.items()}  # this model alone, before the FPL blend
+    w0 = FIRST_WEEK_FPL_WEIGHT
+    for i, a in proj.items():  # same first-week blend with FPL's estimate as `transfers`
+        a[0] = (1 - w0) * a[0] + w0 * float(by_id[i]["ep_next"] or 0) * now.get(i, 1.0)
+    n = min(args.horizon, len(gws))
+    squad = set(team.squad_ids)
+    print(_team_source_line(team))
+
+    # 1. Transfer plan
+    plan = planner.plan_transfers(squad, team.bank_tenths, team.free_transfers, proj, pos, club, price, n)
+    hold = sum(planner.best_xi(squad, w, proj, pos) for w in range(n))
+    print(f"\nTRANSFER PLAN, GW{gws[0]}-{gws[n - 1]} (week by week, real free-transfer and -4 rules):")
+    for w in range(n):
+        mv = plan.moves[w]
+        txt = ", ".join(f"{names[o]} -> {names[i]}" for o, i in mv) if mv else "hold"
+        print(f"  GW{gws[w]}: {txt}")
+    print(f"  Projected: plan {plan.net:.1f} (after -{plan.hits} in hits) vs holding all {n} weeks {hold:.1f}")
+    print("  (Backtest: this planner and one-shot `fpl transfers` finished +54 and -15 against each other over two")
+    print("   seasons - treat this as a timing view, not a proven upgrade.)")
+
+    # 2. Captaincy - ranked by this model's own average: the rule that beat
+    # ceiling-based picks in the weekly backtest. FPL's estimate (mostly recent
+    # form) is shown alongside, not mixed in.
+    first = params[params["gw"] == gws[0]]
+    cands = sorted(squad, key=lambda i: -model_first.get(i, 0))[:5]
+    managers = _managers(args, team)
+    rival_caps = [names[m.captain_id] for m in managers if not m.is_you] if managers else []
+    print(f"\nCAPTAIN, GW{gws[0]} - by this model's average (backtest: beat picking by ceiling in both seasons):")
+    print(f"  {'':<14}{'model avg':>10}{'FPL est.':>10}{'chance 10+':>12}{'90th pct':>10}")
+    for i in cands:
+        sim = player_model.simulate(first[first["player_id"] == i], n=20000, seed=i)
+        print(f"  {names[i]:<14}{model_first.get(i, 0):>10.1f}{float(by_id[i]['ep_next'] or 0):>10.1f}"
+              f"{(sim >= 10).mean():>12.0%}{np.percentile(sim, 90):>10.0f}{'   <- captain' if i == cands[0] else ''}")
+    if rival_caps:
+        print(f"  Rivals' captains last deadline: {', '.join(rival_caps)}")
+
+    # 3. Chips
+    print("\nCHIPS still available:")
+    for c in windows:
+        print(f"  {c['name']:<9} GW{c['start']}-{c['stop']}")
+    in_window = [w for w, g in enumerate(gws) if g <= first_half_end]
+    if in_window:
+        bb = chips.bench_boost_values(squad, proj, pos, len(gws))
+        budget = sum(price[i] for i in squad) + team.bank_tenths
+        fh = chips.free_hit_values(squad, budget, proj, pos, club, price, len(in_window))
+        wc, normal = chips.wildcard_value(squad, team.bank_tenths, team.free_transfers, proj, pos, club, price, n)
+        print(f"\n  Projected chip value by gameweek, current squad (first-half chips expire after GW{first_half_end}):")
+        print(f"  {'GW':<5}{'Bench Boost':>12}{'Free Hit':>10}")
+        for w in in_window:
+            print(f"  {gws[w]:<5}{bb[w]:>12.1f}{fh[w]:>10.1f}")
+        print(f"  Wildcard now: best fresh squad {wc:.1f} vs best normal-transfer plan {normal:.1f} over GW{gws[0]}-{gws[n - 1]} "
+              f"(+{wc - normal:.1f})")
+        bench = [i for i in squad if by_id[i]["status"] != "a"]
+        if bench:
+            print("  Flagged in your 15 (hurts Bench Boost): " + ", ".join(f"{names[i]} ({by_id[i]['status']})" for i in bench))
+    if managers:
+        for m in managers:
+            if not m.is_you:
+                used = [f"{c['name']} GW{c['event']}" for c in live.history(m.entry_id, args.refresh).get("chips", [])]
+                print(f"  {m.name} has used: {', '.join(used) or 'nothing'}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="fpl", description="Fantasy Premier League squad predictor/optimizer.")
     parser.add_argument("--horizon", type=int, default=5, help="Number of upcoming gameweeks to project over (default 5).")
@@ -353,6 +439,10 @@ def main() -> None:
     league_p = sub.add_parser("league", help="Your mini-league: gaps, squad strength, rival ownership, fixture odds.")
     live_flags(league_p)
     league_p.set_defaults(func=cmd_league)
+
+    plan_p = sub.add_parser("plan", help="Week-by-week transfer plan, captain options and chip outlook.")
+    live_flags(plan_p)
+    plan_p.set_defaults(func=cmd_plan)
 
     args = parser.parse_args()
     args.func(args)

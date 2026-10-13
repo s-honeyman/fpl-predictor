@@ -201,22 +201,86 @@ def position_rates(prev_players: pd.DataFrame) -> dict[int, tuple[float, float]]
     return out
 
 
-def live_projection(bootstrap: dict, fixtures: list[dict], gameweeks: list[int],
-                    availability_now: dict[int, float], availability_later: dict[int, float]) -> dict[int, tuple[float, float]]:
-    """The decomposition for the live season: history from FPL's per-gameweek
-    live data, priors and position rates from last season's archive, fixtures
-    from the goals model. Returns player_id -> (points over gameweeks, first gameweek)."""
+def live_inputs(bootstrap: dict, fixtures: list[dict]):
+    """Everything the decomposition needs for the live season: history from
+    FPL's per-gameweek live data, last season's priors/position rates from the
+    archive, the goals model, and the fixture lookup."""
     from . import api, model, team_ratings
 
     finished = [e["id"] for e in bootstrap["events"] if model._gameweek_effectively_finished(e["id"], e, fixtures)]
-    live = {gw: api.get_gameweek_live(gw) for gw in finished}
-    hist = history_from_live(bootstrap, live, fixtures)
+    hist = history_from_live(bootstrap, {gw: api.get_gameweek_live(gw) for gw in finished}, fixtures)
     start_year = int(bootstrap["events"][0]["deadline_time"][:4])
     prev = f"{start_year - 1}-{str(start_year)[2:]}"
     prev_players = pd.read_csv(api.get_archive_csv(f"{prev}/players_raw.csv", f"players_{prev}.csv"))
     ids_by_name = {f"{p['first_name']} {p['second_name']}": p["id"] for p in bootstrap["elements"]}
     priors = priors_from_previous_season(prev_players, lambda r: f"{r['first_name']} {r['second_name']}", ids_by_name)
     ratings, _ = team_ratings.live_ratings(bootstrap, fixtures)
-    lookup = model.build_team_fixture_lookup(fixtures)
-    return project(bootstrap["elements"], hist, lookup, gameweeks, ratings, priors, position_rates(prev_players),
+    return hist, model.build_team_fixture_lookup(fixtures), ratings, priors, position_rates(prev_players)
+
+
+def live_projection(bootstrap: dict, fixtures: list[dict], gameweeks: list[int],
+                    availability_now: dict[int, float], availability_later: dict[int, float]) -> dict[int, tuple[float, float]]:
+    """Returns player_id -> (points over gameweeks, first gameweek) for the live season."""
+    hist, lookup, ratings, priors, rates = live_inputs(bootstrap, fixtures)
+    return project(bootstrap["elements"], hist, lookup, gameweeks, ratings, priors, rates,
                    availability_now, availability_later)
+
+
+def fixture_params(elements: list[dict], history: pd.DataFrame, fixture_lookup: dict, gameweeks: list[int],
+                   ratings, priors: dict[int, dict], pos_rates: dict[int, tuple[float, float]],
+                   availability_now: dict[int, float] | None = None,
+                   availability_later: dict[int, float] | None = None) -> pd.DataFrame:
+    """One row per player-fixture with every ingredient of the projection, so
+    callers can take expected points per gameweek or simulate a distribution
+    (captaincy ceilings) from the same numbers `project` uses."""
+    prof = _player_profiles(history, gameweeks[0], priors, pos_rates)
+    avail_now, avail_later = availability_now or {}, availability_later or {}
+    rows = []
+    for p in elements:
+        pid, team, et = p["id"], p["team"], p["element_type"]
+        if pid in prof.index:
+            r = prof.loc[pid]
+            p60, psub, xg90, xa90, other, sub_pts = r.p60, r.psub, r.xg90, r.xa90, r.other, r.sub_pts
+        else:
+            pr = priors.get(pid, {})
+            pg, pa = pos_rates.get(et, (0.0, 0.0))
+            p60, psub = pr.get("p60", UNKNOWN_P60), pr.get("psub", UNKNOWN_PSUB)
+            xg90, xa90, other, sub_pts = pr.get("xg90", pg), pr.get("xa90", pa), 0.5, 1.0
+        for i, gw in enumerate(gameweeks):
+            a = avail_now.get(pid, 1.0) if i == 0 else avail_later.get(pid, 1.0)
+            for _, is_home, opp in fixture_lookup.get(team, {}).get(gw, []):
+                gf, ga = ratings.expected_goals(team, opp, is_home)
+                r_att, _ = ratings.ratios(team, opp, is_home)
+                lam_g, lam_a = xg90 * 0.95 * r_att, xa90 * 0.95 * r_att
+                full = (2 + GOAL_PTS[et] * lam_g + 3 * lam_a + CS_PTS[et] * math.exp(-ga)
+                        - (_expected_conceded_penalty(ga) if et <= 2 else 0.0) + other)
+                rows.append((pid, gw, et, a * p60, a * psub, sub_pts, lam_g, lam_a, ga, other,
+                             a * (p60 * full + psub * sub_pts)))
+    return pd.DataFrame(rows, columns=["player_id", "gw", "et", "p60", "psub", "sub_pts", "lam_goals",
+                                       "lam_assists", "lam_conceded", "other", "xpts"])
+
+
+def by_gameweek(params: pd.DataFrame, gameweeks: list[int]) -> dict[int, np.ndarray]:
+    """player_id -> expected points for each gameweek in `gameweeks` (doubles summed, blanks 0)."""
+    piv = params.pivot_table(index="player_id", columns="gw", values="xpts", aggfunc="sum").reindex(columns=gameweeks).fillna(0.0)
+    return {int(pid): np.array(row, dtype=float) for pid, row in piv.iterrows()}
+
+
+def simulate(params: pd.DataFrame, n: int = 20000, seed: int = 11) -> np.ndarray:
+    """Simulated FPL points for one player's fixtures in one gameweek (rows of
+    `params` for that player and gameweek). Goals, assists and goals conceded
+    are Poisson; clean sheet follows from conceded; bonus and other extras are
+    held at his average, so ceilings are if anything slightly understated."""
+    rng = np.random.default_rng(seed)
+    total = np.zeros(n)
+    for r in params.itertuples():
+        u = rng.random(n)
+        full = u < r.p60
+        sub = (~full) & (u < r.p60 + r.psub)
+        goals = rng.poisson(r.lam_goals, n)
+        assists = rng.poisson(r.lam_assists, n)
+        conceded = rng.poisson(r.lam_conceded, n)
+        pts = (2 + GOAL_PTS[r.et] * goals + 3 * assists + CS_PTS[r.et] * (conceded == 0)
+               - (conceded // 2 if r.et <= 2 else 0) + r.other)
+        total += np.where(full, pts, 0) + np.where(sub, r.sub_pts, 0)
+    return total
