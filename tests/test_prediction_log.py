@@ -96,3 +96,15 @@ def test_model_points_recorded_and_backfilled_only_before_result():
     gw8 = [e for e in prediction_log._load_raw() if e["gw"] == 8][0]
     assert "model_points" not in gw8  # no hindsight backfill once the result is known
     assert gw8["actual_minutes"] == 90
+
+
+def test_update_before_deadline_replaces_unplayed_prediction_but_never_a_scored_one():
+    df = _df([{"id": 1, "web_name": "Haaland", "predicted_points": 8.0, "model_points": 6.0}])
+    prediction_log.record_predictions(df, gw=8)
+    newer = _df([{"id": 1, "web_name": "Haaland", "predicted_points": 9.0, "model_points": 7.0}])
+    prediction_log.record_predictions(newer, gw=8, update_before_deadline=True)
+    assert prediction_log._load_raw()[0]["model_points"] == 7.0
+    prediction_log.record_actuals(8, {1: 13.0})
+    prediction_log.record_predictions(_df([{"id": 1, "web_name": "Haaland", "predicted_points": 1.0, "model_points": 1.0}]),
+                                      gw=8, update_before_deadline=True)
+    assert prediction_log._load_raw()[0]["model_points"] == 7.0

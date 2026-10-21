@@ -215,6 +215,15 @@ def live_inputs(bootstrap: dict, fixtures: list[dict]):
     ids_by_name = {f"{p['first_name']} {p['second_name']}": p["id"] for p in bootstrap["elements"]}
     priors = priors_from_previous_season(prev_players, lambda r: f"{r['first_name']} {r['second_name']}", ids_by_name)
     ratings, _ = team_ratings.live_ratings(bootstrap, fixtures)
+    # Market-implied goals where bookmakers have priced the match (backtest:
+    # small but consistent gain over the goals model in both test seasons);
+    # the goals model everywhere else.
+    from . import market_odds
+    goals = market_odds.live_match_goals(bootstrap)
+    if goals:
+        match_gw = {(f["team_h"], f["team_a"]): f["event"] for f in fixtures if f.get("event")}
+        next_gw = model.next_gameweeks(bootstrap, fixtures, 1)
+        ratings = market_odds.OddsAdjustedRatings(ratings, goals, match_gw, next_gw[0] if next_gw else 39)
     return hist, model.build_team_fixture_lookup(fixtures), ratings, priors, position_rates(prev_players)
 
 

@@ -88,3 +88,26 @@ def test_team_ratings_recover_obvious_strength_and_home_advantage():
     gf, ga = r.expected_goals(1, 2, True)
     assert gf > ga
     assert r.clean_sheet_prob(1, 2, True) > r.clean_sheet_prob(2, 1, True)
+
+
+def test_market_odds_conversion_and_name_matching():
+    from fpl import market_odds as mo
+    lh, la = mo.implied_goals(2.7, 3.3, 2.7, 1.9, 1.9)
+    assert abs(lh - la) < 0.01
+    fav_h, fav_a = mo.implied_goals(1.2, 7.0, 13.0, 1.4, 3.0)
+    assert fav_h > 2 * fav_a
+    names = {1: "Man Utd", 2: "Spurs", 3: "Ipswich Town", 4: "Man City"}
+    assert mo.match_team("Man United", names) == 1
+    assert mo.match_team("Tottenham", names) == 2
+    assert mo.match_team("Ipswich", names) == 3
+    assert mo.match_team("Man City", names) == 4
+
+
+def test_odds_ratings_fall_back_entirely_when_a_fixture_has_no_odds():
+    from fpl import market_odds as mo
+    names = {1: "A", 2: "B", 3: "C"}
+    ms = [team_ratings.Match("A", "B", 2, 1), team_ratings.Match("B", "C", 1, 1), team_ratings.Match("C", "A", 0, 2)] * 3
+    base = team_ratings.fit_ratings(ms, [], names)
+    r = mo.OddsAdjustedRatings(base, {(1, 2): (2.5, 0.5)}, {(1, 2): 9}, as_of_gw=5)
+    assert r.expected_goals(1, 2, True) == (2.5, 0.5)
+    assert r.ratios(2, 3, True) == base.ratios(2, 3, True)

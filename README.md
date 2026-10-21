@@ -204,3 +204,18 @@ The only tuned constants are the minutes prior for unknown players (tuned on 202
 - **Chips come in two sets this season** (read from FPL, not assumed): one of each for GW1-19, a fresh set for GW20-38; unused first-half chips are lost after GW19. Chip values (Bench Boost, Free Hit, Wildcard against the best normal-transfer plan) are projections, not backtested timing rules - they depend on blank and double gameweeks that FPL only schedules as cup ties get rearranged.
 
 Also from the weekly replay: managing every week with the decomposed model scored 2330/1972, against 2132/1944 when re-optimising every five weeks.
+
+## Bookmaker-implied fixture goals (`fpl/market_odds.py`, `scripts/backtest_market_odds.py`)
+
+Replaces the goals model's per-fixture expected goals and clean-sheet odds with what bookmakers' prices imply: over/under 2.5 fixes each match's expected total goals (independent Poisson), the home/away win prices fix how it splits. Prices are football-data.co.uk's pre-match averages across bookmakers (collected before the round, not closing odds), so the backtest has no look-ahead. Live, played matches come from the season file and upcoming ones from football-data's `fixtures.csv` once they publish it (usually a few days before the round); a fixture without odds falls back to the goals model entirely rather than mixing the two scales.
+
+| | Rank corr. | Top-30 avg | Top-100 avg | Error | Season sim |
+|---|---|---|---|---|---|
+| 2024-25, goals model | 0.592 | 4.59 | 3.66 | 1.465 | 2132 |
+| 2024-25, **market odds** | **0.594** | 4.59 | **3.66** | **1.462** | **2181** |
+| 2025-26, goals model | 0.570 | 4.45 | 3.73 | 1.631 | **1944** |
+| 2025-26, **market odds** | **0.574** | **4.60** | **3.78** | **1.624** | 1929 |
+
+Small, but it wins or ties every prediction measure in both seasons, so it's the default where odds exist. Its smallness confirms the pattern from the goals-model test: rating fixtures better barely moves player rankings.
+
+**What the first live gameweek (GW7) showed:** the decomposed model ranked players better than FPL's own estimate (0.70 vs 0.64, its top 10 averaged 4.8 points vs 3.8, 2 players projected 3+ who didn't play vs 8). But among players who actually played 60+ minutes, ranking accuracy was only 0.16: once it's known who plays, a single week's points are mostly goals and bonus, which history barely predicts. The remaining edge has to come from player-level information - the planned next step is anytime-goalscorer odds via The Odds API, logged alongside the model for several weeks before getting any weight, since historical player odds aren't freely available to backtest.

@@ -27,6 +27,7 @@ it still helps rather than just moving the bias around.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pandas as pd
 
@@ -199,9 +200,20 @@ def _gameweek_effectively_finished(gw: int, event: dict, fixtures: list[dict]) -
     return bool(gw_fixtures) and all(f.get("finished_provisional") for f in gw_fixtures)
 
 
+def _deadline_passed(event: dict) -> bool:
+    """True once a live gameweek's deadline is behind us. Events without a
+    deadline (the backtest's synthetic ones) never count as passed."""
+    d = event.get("deadline_time")
+    return bool(d) and datetime.fromisoformat(d.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+
+
 def next_gameweeks(bootstrap: dict, fixtures: list[dict], horizon: int) -> list[int]:
+    """Gameweeks still open for decisions. A gameweek mid-play is skipped once
+    its deadline has passed - nothing in it can be changed, and FPL's own
+    `ep_next` already refers to the following gameweek by then."""
     events = bootstrap["events"]
-    upcoming = [e["id"] for e in events if not _gameweek_effectively_finished(e["id"], e, fixtures)]
+    upcoming = [e["id"] for e in events
+                if not _gameweek_effectively_finished(e["id"], e, fixtures) and not _deadline_passed(e)]
     upcoming.sort()
     return upcoming[:horizon]
 

@@ -45,12 +45,14 @@ def _rewrite(entries: list[dict]) -> None:
             f.write(json.dumps(e) + "\n")
 
 
-def record_predictions(df: pd.DataFrame, gw: int) -> int:
+def record_predictions(df: pd.DataFrame, gw: int, update_before_deadline: bool = False) -> int:
     """Logs the predicted_points for the immediate next gameweek (`gw`) - call
     this each time the tool projects, right before that gameweek locks.
-    Idempotent: re-running for the same gameweek doesn't duplicate or
-    overwrite an already-logged prediction (the point is to capture what was
-    predicted BEFORE the result was known, not to let hindsight sneak in).
+    Re-running for the same gameweek never duplicates. By default it never
+    overwrites either; with `update_before_deadline=True` (only safe while
+    that gameweek's deadline is still ahead, which the caller guarantees) an
+    unplayed entry is replaced, so the log grades the LAST prediction made
+    before the deadline rather than a stale early one.
     Returns how many new entries were written."""
     existing = _load_raw()
     by_key = {(e["gw"], e["player_id"]): e for e in existing}
@@ -64,7 +66,12 @@ def record_predictions(df: pd.DataFrame, gw: int) -> int:
             # Older entries only stored FPL's ep_next. Adding this model's own
             # number is still honest as long as the result isn't known yet.
             e = by_key[key]
-            if has_model and "model_points" not in e and e.get("actual_points") is None:
+            if e.get("actual_points") is None and update_before_deadline:
+                e["predicted_points"] = float(row["predicted_points"])
+                if has_model:
+                    e["model_points"] = float(row["model_points"])
+                backfilled = True
+            elif has_model and "model_points" not in e and e.get("actual_points") is None:
                 e["model_points"] = float(row["model_points"])
                 backfilled = True
             continue

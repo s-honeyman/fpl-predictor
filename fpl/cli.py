@@ -32,9 +32,8 @@ def _warn_if_gameweek_in_progress(bootstrap: dict, fixtures: list[dict]) -> None
         played = sum(1 for f in gw_fixtures if f.get("started"))
         print(
             f"WARNING: GW{current['id']} is in progress ({played}/{len(gw_fixtures)} fixtures started, "
-            f"not finished) - projections and any transfer/captaincy suggestion below are unreliable "
-            f"right now (players whose match hasn't kicked off yet look artificially worse than players "
-            f"who've already played). Wait until GW{current['id']} is fully finished before acting on this."
+            f"not finished). Its deadline has passed, so planning starts from the next gameweek, but "
+            f"GW{current['id']}'s results aren't in the model yet - re-run once it's finished before acting."
         )
 
 
@@ -83,7 +82,9 @@ def _sync_prediction_log(bootstrap: dict, fixtures: list[dict], df: pd.DataFrame
                 "model_points": df["model_next_gw"],
             }
         )
-        added = prediction_log.record_predictions(log_df, next_gw)
+        # next_gw always has its deadline ahead (model.next_gameweeks skips
+        # passed deadlines), so refreshing the logged prediction is honest.
+        added = prediction_log.record_predictions(log_df, next_gw, update_before_deadline=True)
         if added:
             print(f"(logged {added} predictions for GW{next_gw} - checked against reality once it's played)")
 
@@ -320,9 +321,9 @@ def cmd_league(args: argparse.Namespace) -> None:
 
 
 def cmd_plan(args: argparse.Namespace) -> None:
-    bootstrap = api.get_bootstrap(force_refresh=args.refresh)
-    fixtures = api.get_fixtures(force_refresh=args.refresh)
-    _warn_if_gameweek_in_progress(bootstrap, fixtures)
+    _load_projections(horizon=args.horizon, refresh=args.refresh)  # keeps the prediction log in sync
+    bootstrap = api.get_bootstrap()
+    fixtures = api.get_fixtures()
     team = _live_team(args, bootstrap)
     if team is None:
         raise SystemExit("`fpl plan` needs your linked FPL team: `fpl sync --entry <id> --league <id>`")
