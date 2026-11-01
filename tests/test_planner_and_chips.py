@@ -60,3 +60,36 @@ def test_chip_windows_drop_only_the_half_already_used():
     ]}
     left = chips.chip_windows(boot, [{"name": "3xc", "event": 3}])
     assert {(c["name"], c["start"]) for c in left} == {("3xc", 20), ("wildcard", 2)}
+
+
+def test_bench_boost_week_buys_a_bench_that_plays():
+    # 11 stars (a 4-4-2, 5 pts a week) plus one cheap slot per position, where
+    # a dud (0 pts) and a fit sub (1 pt) cost the same. Only a Bench Boost
+    # makes the fit subs worth choosing.
+    from fpl.optimizer import optimize_multiweek
+    proj, pos, cost = {}, {}, {}
+    pid = 0
+    for p, stars in {1: 1, 2: 4, 3: 4, 4: 2}.items():
+        for _ in range(stars):
+            pid += 1
+            pos[pid], cost[pid], proj[pid] = p, 60, np.array([5.0, 5.0])
+        for pts in (0.0, 1.0):
+            pid += 1
+            pos[pid], cost[pid], proj[pid] = p, 40, np.array([pts, pts])
+    team = {i: i for i in pos}
+    budget = 11 * 60 + 4 * 40
+    _, pts = optimize_multiweek(proj, cost, pos, team, budget, [0, 1])
+    ids, pts_bb = optimize_multiweek(proj, cost, pos, team, budget, [0, 1], bench_boost_week=1)
+    assert pts == 2 * (55 + 5)
+    assert pts_bb == (55 + 5) + (55 + 5 + 4)
+    assert all(proj[i][1] > 0 for i in ids)  # no duds on the bench
+
+
+def test_bench_boost_ignored_in_non_boost_weeks():
+    from fpl.optimizer import optimize_multiweek
+    ids, pos = _squad()
+    proj = {i: np.array([1.0, 1.0]) for i in ids}
+    team = {i: i for i in ids}
+    cost = {i: 50 for i in ids}
+    _, pts = optimize_multiweek(proj, cost, pos, team, 15 * 50, [0, 1], bench_boost_week=1)
+    assert pts == 12 + 16  # week 0: XI + captain; week 1: all 15 + captain

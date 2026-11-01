@@ -194,4 +194,14 @@ def live_match_goals(bootstrap: dict, refresh: bool = False) -> dict[tuple[int, 
             out.update(load_match_goals(tmp, names))
     except (requests.RequestException, OSError, pd.errors.EmptyDataError):
         pass
+    # Upcoming matches football-data hasn't priced yet: use the match odds
+    # saved by `fpl odds --fetch` (The Odds API, same 1X2 + O/U 2.5 data).
+    import json
+    log_dir = ODDS_DIR.parent / "odds_log"
+    for path in sorted(log_dir.glob("gw*.json")) if log_dir.exists() else []:
+        if path.name.endswith("_raw.json"):
+            continue
+        for key, (lh, la) in json.loads(path.read_text()).get("team_xg", {}).items():
+            h, a = (int(x) for x in key.split("-"))
+            out.setdefault((h, a), (lh, la))
     return out

@@ -9,8 +9,9 @@ plans at each step) using per-gameweek projections, so it can say things like
 "hold this week, use two free transfers next week".
 
 Squad points per week are the best legal XI plus captain from the 15, the
-same rules the optimizer uses. Selling price is taken as the current price,
-a slight overestimate of buying power (FPL keeps half of any price rise).
+same rules the optimizer uses. `price` should hold your own players at what
+they'd sell for (FPL keeps half of any rise; `fpl plan` passes that in) and
+everyone else at current price.
 """
 
 from __future__ import annotations

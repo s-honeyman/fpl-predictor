@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from . import planner
-from .optimizer import optimize_squad
+from .optimizer import optimize_multiweek, optimize_squad
 
 
 def chip_windows(bootstrap: dict, used: list[dict]) -> list[dict]:
@@ -49,13 +49,24 @@ def free_hit_values(squad, budget: int, proj, pos, team, price, n_weeks: int) ->
 
 
 def wildcard_value(squad, bank: int, ft: int, proj, pos, team, price, n_weeks: int) -> tuple[float, float]:
-    """(points from the best unconstrained squad over the window, points from
+    """(points from the best fresh squad held over the window, points from
     the best normal-transfer plan over the same window). Both count only
     starting XI + captain; the gap is roughly what a Wildcard now buys."""
     budget = sum(price[i] for i in squad) + bank
-    df = pd.DataFrame([{"id": i, "predicted_points": a[:n_weeks].sum(), "now_cost": price[i], "position_id": pos[i],
-                        "team": team[i], "availability": 1.0} for i, a in proj.items() if i in price])
-    wc_squad = optimize_squad(df, budget=budget).squad_ids
-    wc_pts = sum(planner.best_xi(wc_squad, w, proj, pos) for w in range(n_weeks))
+    _, wc_pts = optimize_multiweek(proj, price, pos, team, budget, list(range(n_weeks)))
     normal = planner.plan_transfers(squad, bank, ft, proj, pos, team, price, n_weeks, beam=20, k=6)
     return wc_pts, normal.net
+
+
+def wildcard_then_bench_boost(squad, bank: int, proj, pos, team, price, n_weeks: int) -> list[tuple[int, float, list[int]]]:
+    """Wildcard now, Bench Boost in a later week of the window (one chip per
+    gameweek, so never the same week). For each Bench Boost week index b:
+    (b, points over the window including all 15 in week b, squad). The squad
+    is chosen knowing week b's bench counts - so it buys a bench that plays,
+    which the XI-only Wildcard above has no reason to do."""
+    budget = sum(price[i] for i in squad) + bank
+    out = []
+    for b in range(1, n_weeks):
+        ids, pts = optimize_multiweek(proj, price, pos, team, budget, list(range(n_weeks)), bench_boost_week=b)
+        out.append((b, pts, ids))
+    return out

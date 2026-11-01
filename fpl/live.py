@@ -48,6 +48,10 @@ def picks(entry_id: int, gw: int, refresh: bool = False) -> dict:
     return _get(f"entry/{entry_id}/event/{gw}/picks/", f"entry_{entry_id}_gw{gw}_picks.json", refresh)
 
 
+def transfers(entry_id: int, refresh: bool = False) -> list[dict]:
+    return _get(f"entry/{entry_id}/transfers/", f"entry_{entry_id}_transfers.json", refresh)
+
+
 def league_standings(league_id: int, refresh: bool = False) -> dict:
     return _get(f"leagues-classic/{league_id}/standings/", f"league_{league_id}.json", refresh)
 
@@ -87,14 +91,36 @@ class LiveTeam:
     free_transfers: int
     chips_used: list[str] = field(default_factory=list)
     pending: list[tuple[int, int]] = field(default_factory=list)
+    sell_price: dict[int, int] = field(default_factory=dict)  # what each of your 15 would fetch now
 
 
-def live_team(entry_id: int, refresh: bool = False) -> LiveTeam:
+def selling_price(purchase: int, now: int) -> int:
+    """FPL keeps half of any rise (rounded down to £0.1m); falls are passed on in full."""
+    return now if now <= purchase else purchase + (now - purchase) // 2
+
+
+def selling_prices(squad_ids: list[int], transfer_list: list[dict], bootstrap: dict) -> dict[int, int]:
+    """Purchase price is the latest transfer that brought each player in; a
+    player held since the start was bought at his start price (now_cost less
+    cost_change_start)."""
+    by_id = {p["id"]: p for p in bootstrap["elements"]}
+    bought = {}
+    for t in sorted(transfer_list, key=lambda t: t["event"]):
+        bought[t["element_in"]] = t["element_in_cost"]
+    out = {}
+    for i in squad_ids:
+        p = by_id[i]
+        out[i] = selling_price(bought.get(i, p["now_cost"] - p.get("cost_change_start", 0)), p["now_cost"])
+    return out
+
+
+def live_team(entry_id: int, refresh: bool = False, bootstrap: dict | None = None) -> LiveTeam:
     e = entry(entry_id, refresh)
     gw = e["current_event"]
     p = picks(entry_id, gw, refresh)
     h = history(entry_id, refresh)
     pk = p["picks"]
+    squad = [x["element"] for x in pk]
     return LiveTeam(
         entry_id=entry_id,
         gameweek=gw,
@@ -106,6 +132,7 @@ def live_team(entry_id: int, refresh: bool = False) -> LiveTeam:
         bank_tenths=p["entry_history"]["bank"],
         free_transfers=free_transfers(h),
         chips_used=[c["name"] for c in h.get("chips", [])],
+        sell_price=selling_prices(squad, transfers(entry_id, refresh), bootstrap) if bootstrap else {},
     )
 
 
@@ -135,7 +162,9 @@ def apply_pending(team: LiveTeam, bootstrap: dict, pending: list[str]) -> LiveTe
         in_p = resolve_player(bootstrap, in_name)
         if out_p["element_type"] != in_p["element_type"]:
             raise ValueError(f"{out_p['web_name']} and {in_p['web_name']} play different positions")
-        team.bank_tenths += out_p["now_cost"] - in_p["now_cost"]
+        team.bank_tenths += team.sell_price.pop(out_p["id"], out_p["now_cost"]) - in_p["now_cost"]
+        if team.sell_price:
+            team.sell_price[in_p["id"]] = in_p["now_cost"]
         for lst in (team.squad_ids, team.starting_ids, team.bench_ids):
             if out_p["id"] in lst:
                 lst[lst.index(out_p["id"])] = in_p["id"]

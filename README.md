@@ -18,6 +18,7 @@ uv run fpl build                                      # initial squad (e.g. for 
 uv run fpl sync --entry <team id> --league <league id> # once: link your real FPL team + mini-league
 uv run fpl transfers                                  # each gameweek: best transfer(s), or hold
 uv run fpl league                                     # gaps, squad strength, rival ownership, fixture odds
+uv run fpl review                                     # after (or during) a gameweek: grade the decisions
 ```
 
 Once linked, `transfers` and `league` read your real team from FPL's public API instead of a hand-maintained file, and work out your free transfers from your history. FPL only publishes picks as of the last deadline, so pass moves you've already made with `--pending "Out>In"`. Player names that clash (three Wilsons, two Hendersons) are refused rather than guessed - use `Name:TEAM`. The ids live in `data/league.json`, which is git-ignored: this repo is public and those ids resolve to real names.
@@ -202,6 +203,8 @@ The only tuned constants are the minutes prior for unknown players (tuned on 202
 - **Planner: mixed** (+54, -15). It times free transfers instead of paying for hits, but isn't proven to score more, so it's a timing view alongside `fpl transfers`, not a replacement. It never buys back a player its own plan sold.
 - **Captaincy: pick by average.** Chasing ceiling lost overall in both seasons, so `fpl plan` recommends the highest-average captain (this model's own number - FPL's estimate is shown beside it, not mixed in) and shows chance-of-10+ and 90th percentile only as information.
 - **Chips come in two sets this season** (read from FPL, not assumed): one of each for GW1-19, a fresh set for GW20-38; unused first-half chips are lost after GW19. Chip values (Bench Boost, Free Hit, Wildcard against the best normal-transfer plan) are projections, not backtested timing rules - they depend on blank and double gameweeks that FPL only schedules as cup ties get rearranged.
+- **Chip values use this model alone in every week.** Transfers and captaincy blend FPL's own estimate into the next gameweek, but doing that for chips made the next week look like the chip week: before GW9 the Free Hit read +18.2 blended against +6.8 on the model alone, because the Free Hit solver piled into players the two sources disagreed on (FPL 8.0 vs model 3.3, and so on), while every later week was model-only.
+- **Wildcard squads are solved over the whole window** (`optimizer.optimize_multiweek`): one squad held for the window, with its own best XI and captain each week, instead of one XI picked on summed points. **Wildcard now + Bench Boost later** solves the same squad knowing that in the Bench Boost week all 15 score, so it buys a bench that plays; the XI-only Wildcard has no reason to. One chip per gameweek, so the Bench Boost is only ever tried in a later week. Both are compared with normal transfers (plus a Bench Boost on your current squad's best week). The Wildcard squad makes no further transfers in the window, which understates it; projected gains from any solver also flatter the option with the most freedom (it optimises against projection noise too), which overstates it. Not backtested.
 
 Also from the weekly replay: managing every week with the decomposed model scored 2330/1972, against 2132/1944 when re-optimising every five weeks.
 
@@ -219,3 +222,47 @@ Replaces the goals model's per-fixture expected goals and clean-sheet odds with 
 Small, but it wins or ties every prediction measure in both seasons, so it's the default where odds exist. Its smallness confirms the pattern from the goals-model test: rating fixtures better barely moves player rankings.
 
 **What the first live gameweek (GW7) showed:** the decomposed model ranked players better than FPL's own estimate (0.70 vs 0.64, its top 10 averaged 4.8 points vs 3.8, 2 players projected 3+ who didn't play vs 8). But among players who actually played 60+ minutes, ranking accuracy was only 0.16: once it's known who plays, a single week's points are mostly goals and bonus, which history barely predicts. The remaining edge has to come from player-level information - the planned next step is anytime-goalscorer odds via The Odds API, logged alongside the model for several weeks before getting any weight, since historical player odds aren't freely available to backtest.
+
+## Goalscorer odds, shadow mode (`fpl/odds_api.py`, `fpl odds`)
+
+Live anytime-goalscorer and assist odds from The Odds API (UK and US bookmakers, about 32 credits per gameweek; the free plan has 500 a month). The key lives in `data/odds_api_key` (git-ignored) and is never printed - request errors are re-raised without the URL, which contains it.
+
+A player's median anytime price becomes a goal rate *if he plays* (bets on non-players are void). The bookmaker margin is removed per team: rates are scaled so that, weighted by the minutes model's chance of each player playing, they add up to the team's market expected goals less ~3% for own goals. Bookmaker names are matched to FPL players strictly (every word must match, with allowances for first-name variants like Ben/Benjamin, compound surnames, and long Spanish/Portuguese names) and ambiguous matches are refused rather than guessed - a loose early version matched "Martin Odegaard" to David Raya Martín.
+
+**Shadow mode:** odds are logged with the model's own rates from the same moment, but carry no weight in projections. Historical player odds aren't free, so the live log is the only test. `fpl odds --evaluate` scores both on every played gameweek (log-likelihood of actual goals, and ranking among players who played 60+); they only get weight if they beat the model over several gameweeks.
+
+```bash
+uv run fpl odds --fetch      # before a deadline (ideally deadline day, after team news)
+uv run fpl odds              # your squad and biggest model/market disagreements
+uv run fpl odds --evaluate   # after the gameweek
+```
+
+## Grading decisions, not predictions (`fpl review`, `fpl/review.py`)
+
+The live log through GW9 showed the model was not the weak link. Over GW7-8 the 30 players it rated highest averaged 0.6-1.0 points a week more than FPL's own top 30 (GW9, still in progress, was level). But among players who actually played 60+ minutes, one week's points barely rank at all (correlation about 0.1). Six fixture and data experiments had moved ranking accuracy by 0.002, while the league was being decided elsewhere:
+- one captaincy week (GW2: Fernandes 23 against Haaland 13);
+- transfers that, eight of them before the GW9 Wildcard, netted 0 points against holding once the -4 was paid. Rob's 4 transfers netted +51.
+
+`fpl review` scores those decisions after (or during) any gameweek, for every manager in the league:
+- **Where the gap moved:** each player's points times your multiplier minus the rival's. Shared players cancel and captains count double, so the list sums exactly to the week's swing.
+- **Season scoreboard:**
+  - transfers: each bought player's points minus the sold one's, from the move until he's sold on, less hits; Wildcard and Free Hit weeks are left out;
+  - captaincy: the armband's extra points, against the best pick in that XI and against this model's top projected starter from the prediction log;
+  - bench: points left on the bench after auto-subs.
+
+Everything comes from FPL's public picks, transfers and live endpoints plus the prediction log, so it also works retroactively. Picks' multipliers already include auto-subs and the vice-captain stand-in.
+
+## Tested and rejected: a minimum-gain bar on transfers (`scripts/backtest_transfer_threshold.py`)
+
+The obvious response to that transfer record is to make only moves that clear a bar. Tested in the weekly replay: the planner's plan against holding (this week's XI, then the best plan with the rolled transfer), moving only if the plan wins by at least the bar over five weeks.
+
+| Bar (pts) | 0 | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|---|
+| 2024-25 | **2401** | 2333 | 2256 | 2330 | 2162 | 2232 |
+| 2025-26 | 2045 | **2131** | 1957 | 1941 | 2012 | 1972 |
+
+There's no trend: one noisy season path each, and the planner already averages about one move a week. No bar. The real churn this season came from the original model in GW3-6; the two moves the current model recommended before the Wildcard both came out ahead.
+
+## Fixed: selling prices
+
+FPL refunds only half of any price rise, rounded down. `transfers` and `plan` used to value your players at current price, overstating buying power (£0.6m on the GW9 squad), so they could recommend moves you couldn't afford. Your 15 are now costed at their real selling price: the latest purchase price from your transfer history, or the start price for players held since GW1. `--pending` moves credit the bank at selling price too.

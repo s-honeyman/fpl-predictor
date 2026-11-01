@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from . import api, chips, league, live, model, planner, player_model, prediction_log, squad_state, team_ratings
+from . import api, chips, league, live, model, odds_api, planner, player_model, prediction_log, review, squad_state, team_ratings
 from .optimizer import SquadResult, optimize_squad
 
 POSITION_ORDER = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
@@ -148,7 +148,7 @@ def _live_team(args: argparse.Namespace, bootstrap: dict) -> live.LiveTeam | Non
         if getattr(args, "pending", None):
             raise SystemExit("--pending needs a linked FPL team - run `fpl sync --entry <id>` first.")
         return None
-    team = live.live_team(cfg["entry_id"], refresh=args.refresh)
+    team = live.live_team(cfg["entry_id"], refresh=args.refresh, bootstrap=bootstrap)
     return live.apply_pending(team, bootstrap, args.pending or [])
 
 
@@ -184,13 +184,15 @@ def cmd_transfers(args: argparse.Namespace) -> None:
         old_ids, bank = saved["squad_ids"], saved.get("bank_tenths", 0)
         free = args.free_transfers if args.free_transfers is not None else 1
         print("Using the locally saved squad (no linked FPL team) - may be out of date.")
-    # Budget must reflect the squad's CURRENT live value, not the stale price
-    # it was bought at - prices drift daily (a held player who's risen in
-    # price makes "hold everything" look infeasible under the old total,
-    # even though holding never costs anything new). Real FPL selling price
-    # is current value minus half of any profit, so full current value is a
-    # slight overestimate of buying power - never an underestimate, so it
-    # can't cause the false-infeasible bug.
+    # Budget is what the squad would really fetch (FPL keeps half of any rise)
+    # plus the bank, and each owned player is costed at that same selling
+    # price, so holding everything is always exactly affordable. Without a
+    # linked team, current value stands in: a slight overestimate of buying power.
+    sell = team.sell_price if team is not None else {}
+    if sell:
+        df = df.copy()
+        owned = df["id"].isin(sell)
+        df.loc[owned, "now_cost"] = df.loc[owned, "id"].map(sell)
     current_squad_value = int(df[df["id"].isin(old_ids)]["now_cost"].sum())
     budget = current_squad_value + bank
 
@@ -332,6 +334,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     pos = {i: p["element_type"] for i, p in by_id.items()}
     club = {i: p["team"] for i, p in by_id.items()}
     price = {i: p["now_cost"] for i, p in by_id.items()}
+    price.update(team.sell_price)  # your own players are worth what they'd sell for
     upcoming = model.next_gameweeks(bootstrap, fixtures, 38)
     hist = live.history(team.entry_id, args.refresh)
     windows = chips.chip_windows(bootstrap, hist.get("chips", []))
@@ -343,6 +346,10 @@ def cmd_plan(args: argparse.Namespace) -> None:
     h, lookup, ratings, priors, rates = player_model.live_inputs(bootstrap, fixtures)
     params = player_model.fixture_params(bootstrap["elements"], h, lookup, gws, ratings, priors, rates, now, later)
     proj = player_model.by_gameweek(params, gws)
+    # Chips compare weeks against each other, so they use this model alone in
+    # every week: blending FPL's estimate into week 1 only made week 1 look
+    # like the chip week (the Free Hit solver piles into wherever the two disagree).
+    proj_model = {i: a.copy() for i, a in proj.items()}
     model_first = {i: a[0] for i, a in proj.items()}  # this model alone, before the FPL blend
     w0 = FIRST_WEEK_FPL_WEIGHT
     for i, a in proj.items():  # same first-week blend with FPL's estimate as `transfers`
@@ -385,16 +392,30 @@ def cmd_plan(args: argparse.Namespace) -> None:
         print(f"  {c['name']:<9} GW{c['start']}-{c['stop']}")
     in_window = [w for w, g in enumerate(gws) if g <= first_half_end]
     if in_window:
-        bb = chips.bench_boost_values(squad, proj, pos, len(gws))
+        bb = chips.bench_boost_values(squad, proj_model, pos, len(gws))
         budget = sum(price[i] for i in squad) + team.bank_tenths
-        fh = chips.free_hit_values(squad, budget, proj, pos, club, price, len(in_window))
-        wc, normal = chips.wildcard_value(squad, team.bank_tenths, team.free_transfers, proj, pos, club, price, n)
-        print(f"\n  Projected chip value by gameweek, current squad (first-half chips expire after GW{first_half_end}):")
+        fh = chips.free_hit_values(squad, budget, proj_model, pos, club, price, len(in_window))
+        print(f"\n  Projected chip value by gameweek, current squad, this model only "
+              f"(first-half chips expire after GW{first_half_end}):")
         print(f"  {'GW':<5}{'Bench Boost':>12}{'Free Hit':>10}")
         for w in in_window:
             print(f"  {gws[w]:<5}{bb[w]:>12.1f}{fh[w]:>10.1f}")
-        print(f"  Wildcard now: best fresh squad {wc:.1f} vs best normal-transfer plan {normal:.1f} over GW{gws[0]}-{gws[n - 1]} "
-              f"(+{wc - normal:.1f})")
+        playable = {c["name"] for c in windows if c["start"] <= gws[0] <= c["stop"]}
+        if "wildcard" in playable:
+            wc, normal = chips.wildcard_value(squad, team.bank_tenths, team.free_transfers, proj_model, pos, club, price, n)
+            print(f"  Wildcard now: best fresh squad {wc:.1f} vs best normal-transfer plan {normal:.1f} over GW{gws[0]}-{gws[n - 1]} "
+                  f"({wc - normal:+.1f})")
+        if {"wildcard", "bboost"} <= playable:
+            combos = chips.wildcard_then_bench_boost(squad, team.bank_tenths, proj_model, pos, club, price, n)
+            base_bb = max(bb[w] for w in range(n))
+            print(f"\n  Wildcard now + Bench Boost later, GW{gws[0]}-{gws[n - 1]} (squad bought knowing that week's bench counts),")
+            print(f"  vs normal transfers + Bench Boost on your current squad's best week ({normal:.1f} + {base_bb:.1f}):")
+            for b, pts, ids in combos:
+                bench_pts = pts - sum(planner.best_xi(ids, w, proj_model, pos) for w in range(n))
+                print(f"    BB GW{gws[b]}: {pts:.1f} (bench adds {bench_pts:.1f})  {pts - normal - base_bb:+.1f}")
+            b, pts, ids = max(combos, key=lambda c: c[1])
+            xi = sorted(ids, key=lambda i: (pos[i], -proj_model[i][b]))
+            print(f"    Squad for BB GW{gws[b]}: " + ", ".join(f"{names[i]} {proj_model[i][b]:.1f}" for i in xi))
         bench = [i for i in squad if by_id[i]["status"] != "a"]
         if bench:
             print("  Flagged in your 15 (hurts Bench Boost): " + ", ".join(f"{names[i]} ({by_id[i]['status']})" for i in bench))
@@ -403,6 +424,170 @@ def cmd_plan(args: argparse.Namespace) -> None:
             if not m.is_you:
                 used = [f"{c['name']} GW{c['event']}" for c in live.history(m.entry_id, args.refresh).get("chips", [])]
                 print(f"  {m.name} has used: {', '.join(used) or 'nothing'}")
+
+
+def _model_rates(bootstrap: dict, fixtures: list[dict], gw: int) -> dict[str, dict]:
+    """This model's own per-player goal/assist rates for `gw`, as known now."""
+    by_id = {p["id"]: p for p in bootstrap["elements"]}
+    now = {i: model._availability_multiplier(p) for i, p in by_id.items()}
+    h, lookup, ratings, priors, rates = player_model.live_inputs(bootstrap, fixtures)
+    prm = player_model.fixture_params(bootstrap["elements"], h, lookup, [gw], ratings, priors, rates, now, now)
+    out = {}
+    for pid, g in prm.groupby("player_id"):
+        out[str(pid)] = {"goals90": float(g["lam_goals"].sum()), "assists90": float(g["lam_assists"].sum()),
+                         "p_play": float(min(1.0, (g["p60"] + g["psub"]).mean())), "xpts": float(g["xpts"].sum())}
+    return out
+
+
+def _evaluate_odds(bootstrap: dict, fixtures: list[dict]) -> None:
+    rows = []
+    for e in bootstrap["events"]:
+        rec = odds_api.load(e["id"])
+        if not rec or "model" not in rec or not model._gameweek_effectively_finished(e["id"], e, fixtures):
+            continue
+        p_play = {int(k): v["p_play"] for k, v in rec["model"].items()}
+        mkt = odds_api.rates_if_playing(rec, p_play)
+        live_stats = {x["id"]: x["stats"] for x in api.get_gameweek_live(e["id"])["elements"]}
+        for pid, m in mkt.items():
+            st, mod = live_stats.get(pid), rec["model"].get(str(pid))
+            if not st or not mod or st["minutes"] == 0:
+                continue
+            rows.append((e["id"], pid, m, mod["goals90"], st["goals_scored"], min(st["minutes"], 90) / 90))
+    if not rows:
+        print("No finished gameweek with logged odds yet - run this after the gameweek has been played.")
+        return
+    d = pd.DataFrame(rows, columns=["gw", "pid", "market", "model", "goals", "exposure"])
+
+    def loglik(rate):
+        lam = np.clip(rate * d["exposure"], 1e-4, None)
+        return float((d["goals"] * np.log(lam) - lam).mean())
+
+    full = d[d["exposure"] >= 60 / 90]
+    print(f"Goal-scoring rates vs what happened - {len(d)} player-matches with minutes, GW{', GW'.join(map(str, sorted(d.gw.unique())))}")
+    print(f"  {'':<14}{'log-likelihood':>16}{'rank corr (60+ mins)':>22}")
+    for col, label in (("model", "our model"), ("market", "bookmakers")):
+        sp = full[[col, "goals"]].corr(method="spearman").iloc[0, 1]
+        print(f"  {label:<14}{loglik(d[col]):>16.4f}{sp:>22.3f}")
+    d["blend"] = np.sqrt(d["model"] * d["market"])
+    full = d[d["exposure"] >= 60 / 90]
+    sp = full[["blend", "goals"]].corr(method="spearman").iloc[0, 1]
+    print(f"  {'50/50 blend':<14}{loglik(d['blend']):>16.4f}{sp:>22.3f}")
+    print("  (higher log-likelihood = better. Too little data to act on until several gameweeks are in.)")
+
+
+def cmd_odds(args: argparse.Namespace) -> None:
+    bootstrap = api.get_bootstrap(force_refresh=args.refresh)
+    fixtures = api.get_fixtures(force_refresh=args.refresh)
+    if args.evaluate:
+        _evaluate_odds(bootstrap, fixtures)
+        return
+    gw = model.next_gameweeks(bootstrap, fixtures, 1)[0]
+    rec = odds_api.load(gw)
+    if args.fetch or rec is None:
+        print(f"Fetching GW{gw} odds from The Odds API (~32 credits)...")
+        rec = odds_api.fetch_gameweek(bootstrap, fixtures, gw)
+    elif args.reprocess:
+        import json as _json
+        raw = _json.loads((odds_api.LOG_DIR / f"gw{gw}_raw.json").read_text())
+        rec = {**odds_api.process(bootstrap, gw, raw), "fetched_at": rec["fetched_at"],
+               "credits_remaining": rec.get("credits_remaining")}
+    rec["model"] = _model_rates(bootstrap, fixtures, gw)
+    (odds_api.LOG_DIR / f"gw{gw}.json").write_text(__import__("json").dumps(rec, indent=1))
+
+    p_play = {int(k): v["p_play"] for k, v in rec["model"].items()}
+    mkt = odds_api.rates_if_playing(rec, p_play)
+    names = {p["id"]: p["web_name"] for p in bootstrap["elements"]}
+    print(f"GW{gw} odds fetched {rec['fetched_at']} | credits left: {rec.get('credits_remaining')} | "
+          f"players matched: {len(rec['players'])}, unmatched names: {len(rec['unmatched_names'])}")
+    print("SHADOW MODE: logged for comparison only, not used in projections yet.\n")
+
+    team = _live_team(args, bootstrap)
+    if team:
+        print("Your squad - expected goals per match IF he plays:")
+        print(f"  {'':<14}{'P(plays)':>9}{'our model':>11}{'bookmakers':>12}")
+        for pid in sorted(team.squad_ids, key=lambda i: -mkt.get(i, 0)):
+            mod = rec["model"].get(str(pid), {})
+            if mod.get("goals90", 0) < 0.05 and pid not in mkt:
+                continue
+            print(f"  {names[pid]:<14}{mod.get('p_play', 0):>9.0%}{mod.get('goals90', 0):>11.2f}"
+                  f"{mkt[pid] if pid in mkt else float('nan'):>12.2f}")
+    likely = [pid for pid in mkt if rec["model"].get(str(pid), {}).get("p_play", 0) >= 0.6
+              and rec["model"][str(pid)]["goals90"] >= 0.05]
+    ratio = {pid: mkt[pid] / rec["model"][str(pid)]["goals90"] for pid in likely}
+    for title, keys in (("Bookmakers MUCH higher than our model", sorted(ratio, key=lambda p: -ratio[p])[:8]),
+                        ("Bookmakers MUCH lower than our model", sorted(ratio, key=lambda p: ratio[p])[:8])):
+        print(f"\n{title} (likely starters):")
+        for pid in keys:
+            print(f"  {names[pid]:<14} model {rec['model'][str(pid)]['goals90']:.2f}  bookmakers {mkt[pid]:.2f}  (x{ratio[pid]:.1f})")
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    cfg = live.load_config()
+    if not cfg or not cfg.get("league_id"):
+        raise SystemExit("Link your team and league first: `fpl sync --entry <id> --league <id>`")
+    bootstrap = api.get_bootstrap(force_refresh=args.refresh)
+    fixtures = api.get_fixtures(force_refresh=args.refresh)
+    names = {p["id"]: p["web_name"] for p in bootstrap["elements"]}
+    started = [e["id"] for e in bootstrap["events"] if e["finished"] or e["is_current"]]
+    gw = args.gw or max(started)
+    finished = {e["id"] for e in bootstrap["events"] if e["finished"]}
+    # Past gameweeks never change; only the one being reviewed may still be live.
+    points = {g: {x["id"]: x["stats"]["total_points"]
+                  for x in api.get_gameweek_live(g, force_refresh=args.refresh and g == gw)["elements"]}
+              for g in range(1, gw + 1)}
+    model_pts: dict[int, dict[int, float]] = {}
+    for e in prediction_log._load_raw():
+        if e.get("model_points") is not None:
+            model_pts.setdefault(e["gw"], {})[e["player_id"]] = e["model_points"]
+
+    standings = live.league_standings(cfg["league_id"], args.refresh)["standings"]["results"]
+    managers = []
+    for r in standings:
+        eid = r["entry"]
+        weeks = [review.week_from_picks(g, live.picks(eid, g, refresh=args.refresh and g == gw)) for g in range(1, gw + 1)]
+        managers.append((r["player_name"].split()[0], eid, weeks, live.transfers(eid, args.refresh)))
+    me = next(m for m in managers if m[1] == cfg["entry_id"])
+
+    played = [f for f in fixtures if f["event"] == gw]
+    status = "" if gw in finished else f" - IN PROGRESS, {sum(f['finished'] or f['finished_provisional'] for f in played)} of {len(played)} matches finished"
+    print(f"\nGW{gw} REVIEW{status}")
+    for name, _, weeks, _ in managers:
+        w = weeks[-1]
+        chip = f" ({w.chip})" if w.chip else ""
+        print(f"  {name:<8} {review.week_points(w, points[gw]) - w.hits:>3}{f' (after -{w.hits})' if w.hits else ''}{chip}"
+              f"   captain {names[w.captain]}")
+
+    mine = me[2][-1]
+    for name, eid, weeks, _ in managers:
+        if eid == me[1]:
+            continue
+        theirs = weeks[-1]
+        swing = review.gap_swing(mine, theirs, points[gw])
+        net = sum(s for _, s in swing) - mine.hits + theirs.hits
+        print(f"\nGap to {name} moved {net:+d} this week. Biggest movers (+ = for you):")
+        for pid, s in swing[:8]:
+            a, b = mine.mult.get(pid, 0), theirs.mult.get(pid, 0)
+            who = (f"you x{a}, {name} x{b}" if a and b else f"you x{a}" if a else f"{name} x{b}")
+            print(f"  {s:+4d}  {names[pid]:<15} {points[gw].get(pid, 0):>3} pts  ({who})")
+
+    through = max(g for g in range(1, gw + 1) if g in finished or g == gw)
+    print(f"\nSEASON DECISION SCOREBOARD (GW1-{through}{', current week still live' if gw not in finished else ''})")
+    print(f"  {'':<8}{'transfers':>10}{'net vs hold':>12}{'captain':>9}{'best in XI':>11}{'model pick':>11}{'bench':>7}")
+    for name, eid, weeks, tr in managers:
+        sb = review.scoreboard(weeks, tr, points, model_pts, through)
+        mp = f"{sb.captain_model}/{sb.model_weeks}wk" if sb.model_weeks else "-"
+        print(f"  {name:<8}{sb.transfers:>10}{sb.transfer_net:>+12d}{sb.captain_pts:>9}{sb.captain_best:>11}{mp:>11}{sb.bench:>7}")
+    print("  net vs hold: each bought player's points minus the sold one's, from the move to now, less hits")
+    print("  (Wildcard/Free Hit weeks left out). captain: the armband's extra points; best in XI: the hindsight")
+    print("  ceiling; model pick: the extra points had you captained this model's top projected starter, over")
+    print("  the weeks the log has its numbers for. bench: points left on the bench after auto-subs.")
+
+    sb = review.scoreboard(me[2], me[3], points, model_pts, through)
+    if sb.transfer_rows:
+        print("\nYour transfers, best and worst:")
+        rows = sorted(sb.transfer_rows, key=lambda r: -r[3])
+        for g, o, i, d in rows[:3] + (rows[3:][-3:] if len(rows) > 3 else []):
+            print(f"  GW{g:<3}{names[o]:>15} -> {names[i]:<15}{d:+4d}")
 
 
 def main() -> None:
@@ -444,6 +629,18 @@ def main() -> None:
     plan_p = sub.add_parser("plan", help="Week-by-week transfer plan, captain options and chip outlook.")
     live_flags(plan_p)
     plan_p.set_defaults(func=cmd_plan)
+
+    odds_p = sub.add_parser("odds", help="Goalscorer odds vs the model (shadow mode), and how each did.")
+    odds_p.add_argument("--fetch", action="store_true", help="Re-fetch from The Odds API (~32 credits).")
+    odds_p.add_argument("--reprocess", action="store_true", help="Re-process saved raw odds (no credits).")
+    odds_p.add_argument("--evaluate", action="store_true", help="Score logged odds vs the model on played gameweeks.")
+    live_flags(odds_p)
+    odds_p.set_defaults(func=cmd_odds)
+
+    review_p = sub.add_parser("review", help="Grade a gameweek's decisions: where the gap to each rival moved, "
+                                             "and a season scoreboard of transfers, captaincy and bench.")
+    review_p.add_argument("--gw", type=int, default=None, help="Gameweek to review (default: the current one).")
+    review_p.set_defaults(func=cmd_review)
 
     args = parser.parse_args()
     args.func(args)

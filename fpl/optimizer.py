@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 import pulp
 
@@ -115,3 +116,63 @@ def optimize_squad(
         total_cost=sum(cost[i] for i in squad_ids),
         predicted_starting_points=round(predicted_starting_points, 2),
     )
+
+
+def optimize_multiweek(
+    proj: dict[int, np.ndarray],
+    cost: dict[int, int],
+    pos: dict[int, int],
+    team: dict[int, int],
+    budget: int,
+    weeks: list[int],
+    bench_boost_week: int | None = None,
+    pool_per_position: int = 60,
+) -> tuple[list[int], float]:
+    """One squad held over several weeks (a Wildcard), with its own best XI
+    and captain each week. In `bench_boost_week` every squad member scores,
+    so a bench of starters is worth money there and only there.
+
+    Returns (squad ids, projected points over `weeks`). The pool is trimmed to
+    each position's top players over the window plus its cheapest, to keep
+    the solve fast without losing budget enablers."""
+    weeks = list(weeks)
+    pool: set[int] = set()
+    for p in (1, 2, 3, 4):
+        ids = [i for i in proj if pos.get(i) == p and i in cost]
+        pool |= set(sorted(ids, key=lambda i: -float(sum(proj[i][w] for w in weeks)))[:pool_per_position])
+        pool |= set(sorted(ids, key=lambda i: cost[i])[:15])
+    ids = sorted(pool)
+    pts = {(i, w): float(proj[i][w]) for i in ids for w in weeks}
+
+    prob = pulp.LpProblem("fpl_multiweek", pulp.LpMaximize)
+    sq = pulp.LpVariable.dicts("squad", ids, cat="Binary")
+    st = pulp.LpVariable.dicts("start", [(i, w) for i in ids for w in weeks], cat="Binary")
+    cp = pulp.LpVariable.dicts("cap", [(i, w) for i in ids for w in weeks], cat="Binary")
+
+    prob += pulp.lpSum(pts[i, w] * ((sq[i] if w == bench_boost_week else st[i, w]) + cp[i, w])
+                       for i in ids for w in weeks)
+    prob += pulp.lpSum(sq[i] for i in ids) == m.SQUAD_SIZE
+    prob += pulp.lpSum(cost[i] * sq[i] for i in ids) <= budget
+    for pos_id, rules in m.FORMATION_RULES.items():
+        prob += pulp.lpSum(sq[i] for i in ids if pos[i] == pos_id) == rules["squad_select"]
+    for t in {team[i] for i in ids}:
+        prob += pulp.lpSum(sq[i] for i in ids if team[i] == t) <= m.MAX_PER_TEAM
+    for w in weeks:
+        prob += pulp.lpSum(cp[i, w] for i in ids) == 1
+        if w == bench_boost_week:
+            for i in ids:
+                prob += cp[i, w] <= sq[i]
+            continue
+        prob += pulp.lpSum(st[i, w] for i in ids) == m.STARTING_XI
+        for i in ids:
+            prob += st[i, w] <= sq[i]
+            prob += cp[i, w] <= st[i, w]
+        for pos_id, rules in m.FORMATION_RULES.items():
+            n = pulp.lpSum(st[i, w] for i in ids if pos[i] == pos_id)
+            prob += n >= rules["min_play"]
+            prob += n <= rules["max_play"]
+
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[prob.status] != "Optimal":
+        raise RuntimeError(f"Solver did not find an optimal squad (status={pulp.LpStatus[prob.status]}).")
+    return [i for i in ids if sq[i].value() > 0.5], float(pulp.value(prob.objective))

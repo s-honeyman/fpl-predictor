@@ -48,6 +48,28 @@ def test_apply_pending_swaps_player_and_updates_bank_and_free_transfers():
     assert t.vice_captain_id == 20
 
 
+def test_selling_price_keeps_half_of_a_rise_and_all_of_a_fall():
+    assert live.selling_price(60, 63) == 61  # +0.3 -> +0.1 (rounded down)
+    assert live.selling_price(60, 64) == 62
+    assert live.selling_price(60, 57) == 57
+
+
+def test_selling_prices_from_latest_purchase_or_start_price():
+    boot = {"elements": [{"id": 10, "now_cost": 46, "cost_change_start": 4},  # held since the start at 4.2
+                         {"id": 20, "now_cost": 55, "cost_change_start": 5}]}
+    transfers = [{"event": 3, "element_in": 20, "element_in_cost": 50},
+                 {"event": 7, "element_in": 20, "element_in_cost": 52}]  # sold and bought back
+    assert live.selling_prices([10, 20], transfers, boot) == {10: 44, 20: 53}
+
+
+def test_apply_pending_sells_at_selling_price():
+    t = _team()
+    t.sell_price = {10: 40, 30: 65}
+    t = live.apply_pending(t, BOOT, ["Ajayi>De Cuyper"])
+    assert t.bank_tenths == 17 + 40 - 51
+    assert t.sell_price == {30: 65, 20: 51}
+
+
 def test_ambiguous_names_are_refused_not_guessed():
     with pytest.raises(ValueError):
         live.resolve_player(BOOT, "Wilson")
@@ -111,3 +133,40 @@ def test_odds_ratings_fall_back_entirely_when_a_fixture_has_no_odds():
     r = mo.OddsAdjustedRatings(base, {(1, 2): (2.5, 0.5)}, {(1, 2): 9}, as_of_gw=5)
     assert r.expected_goals(1, 2, True) == (2.5, 0.5)
     assert r.ratios(2, 3, True) == base.ratios(2, 3, True)
+
+
+def test_bookmaker_player_names_match_strictly_but_tolerate_variants():
+    from fpl import odds_api
+    c = [
+        {"first_name": "David", "second_name": "Raya Martín", "web_name": "Raya"},
+        {"first_name": "Martin", "second_name": "Ødegaard", "web_name": "Ødegaard"},
+        {"first_name": "Benjamin", "second_name": "White", "web_name": "White"},
+        {"first_name": "Josh", "second_name": "Acheampong", "web_name": "Acheampong"},
+        {"first_name": "Ferdi", "second_name": "Kadıoğlu", "web_name": "Kadıoğlu"},
+        {"first_name": "Pascal", "second_name": "Groß", "web_name": "Groß"},
+    ]
+    m = lambda n: (odds_api.match_player(n, c) or {}).get("web_name")
+    assert m("Martin Odegaard") == "Ødegaard"
+    assert m("Martin Odegaard") != "Raya"
+    assert m("Ben White") == "White"
+    assert m("Joshua Kofi Acheampong") == "Acheampong"
+    assert m("Ferdi Kadioglu") == "Kadıoğlu"
+    assert m("Pascal Gross") == "Groß"
+    assert m("Martin Smith") is None
+
+
+def test_long_and_compound_bookmaker_names():
+    from fpl import odds_api
+    c = [
+        {"first_name": "Marcelino", "second_name": "Núñez", "web_name": "Núñez"},
+        {"first_name": "Promise", "second_name": "David", "web_name": "David"},
+        {"first_name": "Ben", "second_name": "Gannon-Doak", "web_name": "Gannon-Doak"},
+        {"first_name": "Nilson", "second_name": "Angulo", "web_name": "Angulo"},
+        {"first_name": "Juan", "second_name": "Angulo", "web_name": "J.Angulo"},
+    ]
+    m = lambda n: (odds_api.match_player(n, c) or {}).get("first_name")
+    assert m("Marcelino Ignacio Nunez Espinoza") == "Marcelino"
+    assert m("Promise Oluwatobi Emmanuel David") == "Promise"
+    assert m("Ben Gannondoak") == "Ben"
+    assert m("Nilson David Angulo Ramirez") == "Nilson"
+    assert m("Juan Riquelme Angulo Caicedo") == "Juan"
